@@ -46,3 +46,8 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+
+
+# Added by cargo
+
+/target
