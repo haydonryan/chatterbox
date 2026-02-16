@@ -8,6 +8,9 @@ fn main() -> PyResult<()> {
         let torchaudio = py.import("torchaudio")?;
         let chatterbox_tts = py.import("chatterbox.tts")?;
 
+
+        // INIT
+        // -------------------------------------------------------------------------------------
         // Detect the best available device
         let device: &str = if torch.getattr("cuda")?.call_method0("is_available")?.extract()? {
             "cuda"
@@ -26,18 +29,27 @@ fn main() -> PyResult<()> {
         println!("[DEBUG] Device & Environment Info");
         println!("-----------------------------------------------------------");
         println!("Using device: {}", device);
+
         let cuda_version = torch.getattr("version")?.getattr("cuda")?;
         println!("CUDA version: {}", cuda_version);
+
         let torch_version = torch.getattr("__version__")?;
         println!("PyTorch version: {}", torch_version);
+
         let cuda_available: bool = torch.getattr("cuda")?.call_method0("is_available")?.extract()?;
         println!("CUDA available: {}", cuda_available);
+
         if cuda_available {
             let cuda_device_count: i32 = torch.getattr("cuda")?.call_method0("device_count")?.extract()?;
             println!("CUDA device count: {}", cuda_device_count);
             let cuda_device_name = torch.getattr("cuda")?.call_method1("get_device_name", (0,))?;
             println!("CUDA device name: {}", cuda_device_name);
         }
+
+        // INIT - END
+        // -------------------------------------------------------------------------------------
+
+
 
         println!("\n-----------------------------------------------------------");
         println!("[DEBUG] Loading ChatterboxTTS Class");
@@ -53,6 +65,11 @@ fn main() -> PyResult<()> {
         println!("[DEBUG] Creating kwargs dict with device='{}'...", device);
         let kwargs = [("device", device)].into_py_dict(py)?;
         println!("[DEBUG] kwargs: {}", kwargs.repr()?);
+        println!("Debugging: {:?}", kwargs.repr()?);
+
+
+
+
 
         println!("\n-----------------------------------------------------------");
         println!("[DEBUG] Loading Model from Pretrained");
@@ -62,6 +79,10 @@ fn main() -> PyResult<()> {
         println!("[DEBUG] Model loaded successfully!");
         println!("[DEBUG] Model type: {}", model.get_type());
         println!("[DEBUG] Model repr: {}", model.repr()?);
+
+
+
+
 
         println!("\n-----------------------------------------------------------");
         println!("[DEBUG] Generating Audio");
