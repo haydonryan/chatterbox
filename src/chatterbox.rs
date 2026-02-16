@@ -270,7 +270,9 @@ impl ChatterboxTTS {
     /// Decoder conditioning length in samples (10 seconds at S3GEN_SR)
     pub const DEC_COND_LEN: u32 = 10 * S3GEN_SR;
 
+    //////////////////////////////////////////////////////////////////////////
     /// Load model from pretrained weights on HuggingFace Hub
+    //////////////////////////////////////////////////////////////////////////
     pub fn from_pretrained(py: Python<'_>, device: Device) -> Result<Self> {
         let torch = py.import("torch")?;
 
@@ -303,13 +305,13 @@ impl ChatterboxTTS {
         };
 
         // Download model files from HuggingFace Hub using Rust hf-hub crate
-        let api = Api::new().map_err(|e| {
+        let huggingface_api = Api::new().map_err(|e| {
             ChatterboxError::Python(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Failed to create HuggingFace API: {}",
                 e
             )))
         })?;
-        let repo = api.model(REPO_ID.to_string());
+        let repo = huggingface_api.model(REPO_ID.to_string());
 
         let mut ckpt_dir: Option<PathBuf> = None;
         for fpath in MODEL_FILES {
@@ -334,7 +336,9 @@ impl ChatterboxTTS {
         Self::from_local(py, &ckpt_dir, actual_device)
     }
 
+    //////////////////////////////////////////////////////////////////////////
     /// Load model from a local checkpoint directory
+    //////////////////////////////////////////////////////////////////////////
     pub fn from_local(py: Python<'_>, ckpt_dir: &Path, device: Device) -> Result<Self> {
         let torch = py.import("torch")?;
         let safetensors = py.import("safetensors.torch")?;
