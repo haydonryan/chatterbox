@@ -336,12 +336,89 @@ impl ChatterboxTTS {
 
     /// Load model from a local checkpoint directory
     pub fn from_local(py: Python<'_>, ckpt_dir: &Path, device: Device) -> Result<Self> {
-        let tts_module = py.import("chatterbox.tts")?;
-        let tts_class = tts_module.getattr("ChatterboxTTS")?;
+        let torch = py.import("torch")?;
+        let safetensors = py.import("safetensors.torch")?;
+        let load_file = safetensors.getattr("load_file")?;
 
-        let ckpt_str = ckpt_dir.to_string_lossy();
-        let instance =
-            tts_class.call_method1("from_local", (ckpt_str.as_ref(), device.as_str()))?;
+        // Import model classes
+        let voice_encoder_mod = py.import("chatterbox.models.voice_encoder")?;
+        let t3_mod = py.import("chatterbox.models.t3")?;
+        let s3gen_mod = py.import("chatterbox.models.s3gen")?;
+        let tokenizers_mod = py.import("chatterbox.models.tokenizers")?;
+        let tts_mod = py.import("chatterbox.tts")?;
+
+        let voice_encoder_class = voice_encoder_mod.getattr("VoiceEncoder")?;
+        let t3_class = t3_mod.getattr("T3")?;
+        let s3gen_class = s3gen_mod.getattr("S3Gen")?;
+        let en_tokenizer_class = tokenizers_mod.getattr("EnTokenizer")?;
+        let conditionals_class = tts_mod.getattr("Conditionals")?;
+        let chatterbox_class = tts_mod.getattr("ChatterboxTTS")?;
+
+        let device_str = device.as_str();
+
+        // Always load to CPU first for non-CUDA devices to handle CUDA-saved models
+        let map_location = if device == Device::Cpu || device == Device::Mps {
+            Some(torch.call_method1("device", ("cpu",))?)
+        } else {
+            None
+        };
+
+        println!("[DEBUG] Loading VoiceEncoder...");
+        let ve = voice_encoder_class.call0()?;
+        let ve_path = ckpt_dir.join("ve.safetensors");
+        let ve_state = load_file.call1((ve_path.to_string_lossy().as_ref(),))?;
+        ve.call_method1("load_state_dict", (ve_state,))?;
+        ve.call_method1("to", (device_str,))?;
+        ve.call_method0("eval")?;
+
+        println!("[DEBUG] Loading T3...");
+        let t3 = t3_class.call0()?;
+        let t3_path = ckpt_dir.join("t3_cfg.safetensors");
+        let t3_state = load_file.call1((t3_path.to_string_lossy().as_ref(),))?;
+        // Check if "model" key exists and extract it
+        let t3_state = if t3_state.call_method0("keys")?.call_method1("__contains__", ("model",))?.extract::<bool>()? {
+            t3_state.get_item("model")?.get_item(0)?
+        } else {
+            t3_state
+        };
+        t3.call_method1("load_state_dict", (t3_state,))?;
+        t3.call_method1("to", (device_str,))?;
+        t3.call_method0("eval")?;
+
+        println!("[DEBUG] Loading S3Gen...");
+        let s3gen = s3gen_class.call0()?;
+        let s3gen_path = ckpt_dir.join("s3gen.safetensors");
+        let s3gen_state = load_file.call1((s3gen_path.to_string_lossy().as_ref(),))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("strict", false)?;
+        s3gen.call_method("load_state_dict", (s3gen_state,), Some(&kwargs))?;
+        s3gen.call_method1("to", (device_str,))?;
+        s3gen.call_method0("eval")?;
+
+        println!("[DEBUG] Loading EnTokenizer...");
+        let tokenizer_path = ckpt_dir.join("tokenizer.json");
+        let tokenizer = en_tokenizer_class.call1((tokenizer_path.to_string_lossy().as_ref(),))?;
+
+        // Load conditionals if conds.pt exists
+        let conds_path = ckpt_dir.join("conds.pt");
+        let conds = if conds_path.exists() {
+            println!("[DEBUG] Loading Conditionals from conds.pt...");
+            let conds_path_str = conds_path.to_string_lossy();
+            let loaded_conds = if let Some(ref map_loc) = map_location {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("map_location", map_loc)?;
+                conditionals_class.call_method("load", (conds_path_str.as_ref(),), Some(&kwargs))?
+            } else {
+                conditionals_class.call_method1("load", (conds_path_str.as_ref(),))?
+            };
+            loaded_conds.call_method1("to", (device_str,))?
+        } else {
+            py.None().into_bound(py)
+        };
+
+        println!("[DEBUG] Creating ChatterboxTTS instance...");
+        // Create the ChatterboxTTS instance directly
+        let instance = chatterbox_class.call1((t3, s3gen, ve, tokenizer, device_str, conds))?;
 
         Ok(Self {
             inner: instance.into(),
