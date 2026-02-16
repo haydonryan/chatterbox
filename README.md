@@ -177,5 +177,14 @@ If you find this model useful, please consider citing.
   note         = {GitHub repository}
 }
 ```
+
+# Rust rewrite:
+```
+conda create -yn chatterbox-rs python=3.11
+conda activate chatterbox-rs
+# Must set the following environment variable to get this to run.
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib/
+cargo run
+```
 ## Disclaimer
 Don't use this model to do bad things. Prompts are sourced from freely available data on the internet.
