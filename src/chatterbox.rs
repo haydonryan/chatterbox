@@ -1,6 +1,7 @@
+use hf_hub::api::sync::Api;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{ChatterboxError, Result};
 
@@ -272,8 +273,6 @@ impl ChatterboxTTS {
     /// Load model from pretrained weights on HuggingFace Hub
     pub fn from_pretrained(py: Python<'_>, device: Device) -> Result<Self> {
         let torch = py.import("torch")?;
-        let hf_hub = py.import("huggingface_hub")?;
-        let pathlib = py.import("pathlib")?;
 
         // Check MPS availability and fall back to CPU if needed
         let actual_device = if device == Device::Mps {
@@ -303,26 +302,36 @@ impl ChatterboxTTS {
             device
         };
 
-        // Download model files from HuggingFace Hub
-        let hf_hub_download = hf_hub.getattr("hf_hub_download")?;
-        let mut local_path: Option<Bound<'_, PyAny>> = None;
+        // Download model files from HuggingFace Hub using Rust hf-hub crate
+        let api = Api::new().map_err(|e| {
+            ChatterboxError::Python(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to create HuggingFace API: {}",
+                e
+            )))
+        })?;
+        let repo = api.model(REPO_ID.to_string());
 
+        let mut ckpt_dir: Option<PathBuf> = None;
         for fpath in MODEL_FILES {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("repo_id", REPO_ID)?;
-            kwargs.set_item("filename", *fpath)?;
-            local_path = Some(hf_hub_download.call((), Some(&kwargs))?);
+            println!("[DEBUG] Downloading: {}", fpath);
+            let local_path = repo.get(fpath).map_err(|e| {
+                ChatterboxError::Python(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to download {}: {}",
+                    fpath, e
+                )))
+            })?;
+            println!("[DEBUG] Downloaded to: {}", local_path.display());
+            // All files go to the same directory, so we just need the parent of any file
+            if ckpt_dir.is_none() {
+                ckpt_dir = local_path.parent().map(|p| p.to_path_buf());
+            }
         }
 
-        // Get parent directory of downloaded files
-        let local_path = local_path.expect("MODEL_FILES should not be empty");
-        let path_obj = pathlib.getattr("Path")?.call1((local_path,))?;
-        let parent = path_obj.getattr("parent")?;
-        let ckpt_dir_str: String = parent.call_method0("__str__")?.extract()?;
-        let ckpt_dir = Path::new(&ckpt_dir_str);
+        let ckpt_dir = ckpt_dir.expect("MODEL_FILES should not be empty");
+        println!("[DEBUG] Model directory: {}", ckpt_dir.display());
 
         // Load from local directory
-        Self::from_local(py, ckpt_dir, actual_device)
+        Self::from_local(py, &ckpt_dir, actual_device)
     }
 
     /// Load model from a local checkpoint directory
