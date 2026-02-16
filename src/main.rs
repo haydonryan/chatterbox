@@ -31,8 +31,10 @@ fn main() -> Result<()> {
         println!("\n-----------------------------------------------------------");
         println!("Generating Audio");
         println!("-----------------------------------------------------------");
-        let text = "Ezreal and Jinx teamed up with Ahri, Yasuo, and Teemo \
-                    to take down the enemy's Nexus in an epic late-game pentakill.";
+        let text = "Hello there, this is a test of chatterbox text to speech";
+                   // #to take down the enemy's Nexus in an epic late-game pentakill.";
+        //let text = "Ezreal and Jinx teamed up with Ahri, Yasuo, and Teemo \
+        //            to take down the enemy's Nexus in an epic late-game pentakill.";
         println!("Text: \"{}\"", text);
 
         let options = GenerateOptions::new().temperature(0.8).cfg_weight(0.5);

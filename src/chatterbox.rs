@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyDict};
+use pyo3::types::PyDict;
 use std::path::Path;
 
 use crate::error::{ChatterboxError, Result};
@@ -7,6 +7,18 @@ use crate::error::{ChatterboxError, Result};
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
 pub const S3_SR: u32 = 16000; // Input sample rate for conditioning
+
+// HuggingFace repo ID for model weights
+const REPO_ID: &str = "ResembleAI/chatterbox";
+
+// Model files to download
+const MODEL_FILES: &[&str] = &[
+    "ve.safetensors",
+    "t3_cfg.safetensors",
+    "s3gen.safetensors",
+    "tokenizer.json",
+    "conds.pt",
+];
 
 /// Compute device for model inference
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,16 +271,58 @@ impl ChatterboxTTS {
 
     /// Load model from pretrained weights on HuggingFace Hub
     pub fn from_pretrained(py: Python<'_>, device: Device) -> Result<Self> {
-        let tts_module = py.import("chatterbox.tts")?;
-        let tts_class = tts_module.getattr("ChatterboxTTS")?;
+        let torch = py.import("torch")?;
+        let hf_hub = py.import("huggingface_hub")?;
+        let pathlib = py.import("pathlib")?;
 
-        let kwargs = [("device", device.as_str())].into_py_dict(py)?;
-        let instance = tts_class.call_method("from_pretrained", (), Some(&kwargs))?;
+        // Check MPS availability and fall back to CPU if needed
+        let actual_device = if device == Device::Mps {
+            let mps_available: bool = torch
+                .getattr("backends")?
+                .getattr("mps")?
+                .call_method0("is_available")?
+                .extract()?;
 
-        Ok(Self {
-            inner: instance.into(),
-            device,
-        })
+            if !mps_available {
+                let mps_built: bool = torch
+                    .getattr("backends")?
+                    .getattr("mps")?
+                    .call_method0("is_built")?
+                    .extract()?;
+
+                if !mps_built {
+                    println!("MPS not available because the current PyTorch install was not built with MPS enabled.");
+                } else {
+                    println!("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.");
+                }
+                Device::Cpu
+            } else {
+                device
+            }
+        } else {
+            device
+        };
+
+        // Download model files from HuggingFace Hub
+        let hf_hub_download = hf_hub.getattr("hf_hub_download")?;
+        let mut local_path: Option<Bound<'_, PyAny>> = None;
+
+        for fpath in MODEL_FILES {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("repo_id", REPO_ID)?;
+            kwargs.set_item("filename", *fpath)?;
+            local_path = Some(hf_hub_download.call((), Some(&kwargs))?);
+        }
+
+        // Get parent directory of downloaded files
+        let local_path = local_path.expect("MODEL_FILES should not be empty");
+        let path_obj = pathlib.getattr("Path")?.call1((local_path,))?;
+        let parent = path_obj.getattr("parent")?;
+        let ckpt_dir_str: String = parent.call_method0("__str__")?.extract()?;
+        let ckpt_dir = Path::new(&ckpt_dir_str);
+
+        // Load from local directory
+        Self::from_local(py, ckpt_dir, actual_device)
     }
 
     /// Load model from a local checkpoint directory
