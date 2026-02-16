@@ -4,7 +4,26 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tch = { version = "0.23.0", features = ["download-libtorch"] }
+
 [dependencies.pyo3]
 version = "0.28.0"
 # Enabling this cargo feature will cause PyO3 to start a Python interpreter on first call to `Python::attach`
 features = ["auto-initialize"]
+
+
+[featuers]
+default=["cuda"]
+cuda=[]
+
+
+[env]
+# Specify CUDA version for torch-sys
+TORCH_CUDA_VERSION = "12.4"
+# Force CUDA build
+USE_CUDA = "1"
+
+[dev-dependencies]
+# For real audio I/O, you might also want:
+# hound = "3.5"  # For WAV file reading/writing
+# rodio = "0.17" # For audio playback
