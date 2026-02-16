@@ -4,7 +4,7 @@ use pyo3::types::PyDict;
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChatterboxError, Result};
-use crate::models::{VoiceEncoder, T3};
+use crate::models::{S3Gen, VoiceEncoder, T3};
 
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
