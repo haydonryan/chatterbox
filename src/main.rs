@@ -1,5 +1,6 @@
 mod chatterbox;
 mod error;
+mod models;
 
 use pyo3::prelude::*;
 use std::path::Path;

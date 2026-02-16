@@ -4,6 +4,7 @@ use pyo3::types::PyDict;
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChatterboxError, Result};
+use crate::models::{VoiceEncoder, T3};
 
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
@@ -345,14 +346,10 @@ impl ChatterboxTTS {
         let load_file = safetensors.getattr("load_file")?;
 
         // Import model classes
-        let voice_encoder_mod = py.import("chatterbox.models.voice_encoder")?;
-        let t3_mod = py.import("chatterbox.models.t3")?;
         let s3gen_mod = py.import("chatterbox.models.s3gen")?;
         let tokenizers_mod = py.import("chatterbox.models.tokenizers")?;
         let tts_mod = py.import("chatterbox.tts")?;
 
-        let voice_encoder_class = voice_encoder_mod.getattr("VoiceEncoder")?;
-        let t3_class = t3_mod.getattr("T3")?;
         let s3gen_class = s3gen_mod.getattr("S3Gen")?;
         let en_tokenizer_class = tokenizers_mod.getattr("EnTokenizer")?;
         let conditionals_class = tts_mod.getattr("Conditionals")?;
@@ -367,16 +364,18 @@ impl ChatterboxTTS {
             None
         };
 
+        // Load VoiceEncoder using Rust wrapper
         println!("[DEBUG] Loading VoiceEncoder...");
-        let ve = voice_encoder_class.call0()?;
+        let ve = VoiceEncoder::new(py)?;
         let ve_path = ckpt_dir.join("ve.safetensors");
         let ve_state = load_file.call1((ve_path.to_string_lossy().as_ref(),))?;
-        ve.call_method1("load_state_dict", (ve_state,))?;
-        ve.call_method1("to", (device_str,))?;
-        ve.call_method0("eval")?;
+        ve.load_state_dict(py, &ve_state)?;
+        ve.to_device(py, device_str)?;
+        ve.eval(py)?;
 
+        // Load T3 using Rust wrapper
         println!("[DEBUG] Loading T3...");
-        let t3 = t3_class.call0()?;
+        let t3 = T3::new(py)?;
         let t3_path = ckpt_dir.join("t3_cfg.safetensors");
         let t3_state = load_file.call1((t3_path.to_string_lossy().as_ref(),))?;
         // Check if "model" key exists and extract it
@@ -385,9 +384,9 @@ impl ChatterboxTTS {
         } else {
             t3_state
         };
-        t3.call_method1("load_state_dict", (t3_state,))?;
-        t3.call_method1("to", (device_str,))?;
-        t3.call_method0("eval")?;
+        t3.load_state_dict(py, &t3_state)?;
+        t3.to_device(py, device_str)?;
+        t3.eval(py)?;
 
         println!("[DEBUG] Loading S3Gen...");
         let s3gen = s3gen_class.call0()?;
@@ -422,7 +421,8 @@ impl ChatterboxTTS {
 
         println!("[DEBUG] Creating ChatterboxTTS instance...");
         // Create the ChatterboxTTS instance directly
-        let instance = chatterbox_class.call1((t3, s3gen, ve, tokenizer, device_str, conds))?;
+        // Pass the inner Python objects from Rust wrappers
+        let instance = chatterbox_class.call1((t3.as_py(), s3gen, ve.as_py(), tokenizer, device_str, conds))?;
 
         Ok(Self {
             inner: instance.into(),
