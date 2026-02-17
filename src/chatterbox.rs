@@ -4,8 +4,9 @@ use pyo3::types::{PyDict, PyList, PySlice};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChatterboxError, Result};
+use crate::models::s3gen::SPEECH_VOCAB_SIZE;
 use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3, T3Cond, VoiceEncoder};
-use tch::{Device as TchDevice, Kind as TchKind, Tensor as TchTensor};
+use tch::{Device as TchDevice, IndexOp, Kind as TchKind, Tensor as TchTensor};
 
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
@@ -701,9 +702,6 @@ impl ChatterboxTTS {
         let device_str = self.device.as_str();
         let torch = py.import("torch")?.unbind();
         let torch_fn = py.import("torch.nn.functional")?.unbind();
-        let s3tokenizer_mod = py.import("chatterbox.models.s3tokenizer")?.unbind();
-        let drop_invalid_tokens = s3tokenizer_mod.getattr(py, "drop_invalid_tokens")?;
-
         if let Some(ref path) = options.audio_prompt_path {
             self.prepare_conditionals(py, Path::new(path), Some(options.exaggeration))?;
         } else {
@@ -785,17 +783,13 @@ impl ChatterboxTTS {
             Ok(speech_tokens.bind(py).get_item(0)?.unbind())
         })();
         inference_mode.call_method1(py, "__exit__", (py.None(), py.None(), py.None()))?;
-        let mut speech_tokens = speech_tokens_result?;
-
-        speech_tokens = drop_invalid_tokens.call1(py, (speech_tokens,))?;
-        let mask = speech_tokens.call_method1(py, "__lt__", (6561,))?;
-        speech_tokens = speech_tokens.call_method1(py, "__getitem__", (mask,))?;
-        speech_tokens = speech_tokens.call_method1(py, "to", (device_str,))?;
+        let speech_tokens = speech_tokens_result?;
 
         let gen_any = conds.getattr(py, "gen")?;
         let gen_dict = gen_any.bind(py);
         let ref_dict = self.py_ref_to_s3gen(py, &gen_dict)?;
         let tokens_tch = py_tensor_to_tch(py, &speech_tokens.bind(py))?;
+        let tokens_tch = drop_invalid_s3_tokens(&tokens_tch)?;
         let wav_tch = self
             .s3gen_rs
             .inference(&tokens_tch, &ref_dict, &S3GenInferenceOptions::default())?
@@ -904,6 +898,44 @@ fn s3gen_ref_to_py(py: Python<'_>, ref_dict: &S3GenRef) -> Result<Py<PyAny>> {
     dict.set_item("prompt_feat_len", py.None())?;
     dict.set_item("embedding", embedding)?;
     Ok(dict.into())
+}
+
+fn drop_invalid_s3_tokens(tokens: &TchTensor) -> Result<TchTensor> {
+    let mut x = if tokens.dim() == 2 && tokens.size()[0] == 1 {
+        tokens.squeeze_dim(0)
+    } else {
+        tokens.shallow_clone()
+    };
+    if x.dim() != 1 {
+        return Err(ChatterboxError::ShapeMismatch(
+            "drop_invalid_s3_tokens expects [T] or [1, T] tokens".to_string(),
+        ));
+    }
+
+    let sos = SPEECH_VOCAB_SIZE;
+    let eos = SPEECH_VOCAB_SIZE + 1;
+    let mut start = 0_i64;
+    let mut end = x.size()[0];
+
+    let sos_mask = x.eq(sos);
+    if sos_mask.any().int64_value(&[]) != 0 {
+        let idx = sos_mask.nonzero();
+        start = idx.i((0, 0)).int64_value(&[]) + 1;
+    }
+    let eos_mask = x.eq(eos);
+    if eos_mask.any().int64_value(&[]) != 0 {
+        let idx = eos_mask.nonzero();
+        end = idx.i((0, 0)).int64_value(&[]);
+    }
+
+    let len = end.saturating_sub(start);
+    if len == 0 {
+        return Ok(TchTensor::zeros([0], (x.kind(), x.device())));
+    }
+    x = x.narrow(0, start, len);
+
+    let mask = x.lt(SPEECH_VOCAB_SIZE);
+    Ok(x.masked_select(&mask))
 }
 
 /// Utility function to print device and environment info
