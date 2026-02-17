@@ -405,6 +405,8 @@ pub struct ChatterboxTTS {
     tokenizer: EnTokenizer,
     /// Rust-native S3Gen inference
     s3gen_rs: S3Gen,
+    /// Rust-native VoiceEncoder
+    voice_encoder: VoiceEncoder,
 }
 
 impl ChatterboxTTS {
@@ -499,14 +501,10 @@ impl ChatterboxTTS {
             let _ = torch.call_method1("device", ("cpu",))?;
         }
 
-        // Load VoiceEncoder using Rust wrapper
-        println!("[DEBUG] Loading VoiceEncoder...");
-        let ve = VoiceEncoder::new(py)?;
+        // Load VoiceEncoder using Rust implementation
+        println!("[DEBUG] Loading VoiceEncoder (Rust)...");
         let ve_path = ckpt_dir.join("ve.safetensors");
-        let ve_state = load_file.call1((ve_path.to_string_lossy().as_ref(),))?;
-        ve.load_state_dict(py, &ve_state)?;
-        ve.to_device(py, device_str)?;
-        ve.eval(py)?;
+        let voice_encoder = VoiceEncoder::from_safetensors(&ve_path, device.to_tch_device())?;
 
         // Load T3 using Rust wrapper
         println!("[DEBUG] Loading T3...");
@@ -557,7 +555,7 @@ impl ChatterboxTTS {
         ns_kwargs.set_item("sr", S3GEN_SR)?;
         ns_kwargs.set_item("t3", t3.as_py())?;
         ns_kwargs.set_item("s3gen", s3gen)?;
-        ns_kwargs.set_item("ve", ve.as_py())?;
+        ns_kwargs.set_item("ve", py.None())?;
         ns_kwargs.set_item("tokenizer", tokenizer.as_py())?;
         ns_kwargs.set_item("device", device_str)?;
         ns_kwargs.set_item("conds", conds)?;
@@ -568,6 +566,7 @@ impl ChatterboxTTS {
             device,
             tokenizer,
             s3gen_rs,
+            voice_encoder,
         })
     }
 
@@ -622,22 +621,12 @@ impl ChatterboxTTS {
         let device_str = self.device.as_str();
         let t3_obj = self.inner.getattr(py, "t3")?;
         let t3 = t3_obj.bind(py);
-        let ve_obj = self.inner.getattr(py, "ve")?;
-        let ve = ve_obj.bind(py);
-
         // Load reference wav at 24kHz
         let load_kwargs = PyDict::new(py);
         load_kwargs.set_item("sr", S3GEN_SR)?;
         let wav_tuple = librosa.call_method("load", (wav_str.as_ref(),), Some(&load_kwargs))?;
         let s3gen_ref_wav_np = wav_tuple.get_item(0)?;
         let s3gen_ref_wav = torch.call_method1("from_numpy", (s3gen_ref_wav_np.clone(),))?;
-
-        // Resample to 16kHz for voice encoder (Python path for now)
-        let resample_kwargs = PyDict::new(py);
-        resample_kwargs.set_item("orig_sr", S3GEN_SR)?;
-        resample_kwargs.set_item("target_sr", S3_SR)?;
-        let ref_16k_wav =
-            librosa.call_method("resample", (s3gen_ref_wav_np,), Some(&resample_kwargs))?;
 
         // Truncate decoder conditioning audio
         let dec_slice = PySlice::new(py, 0, Self::DEC_COND_LEN as isize, 1);
@@ -674,19 +663,18 @@ impl ChatterboxTTS {
             None
         };
 
-        // Voice-encoder speaker embedding
-        let wavs_list = PyList::new(py, &[ref_16k_wav])?;
-        let ve_kwargs = PyDict::new(py);
-        ve_kwargs.set_item("sample_rate", S3_SR)?;
-        ve_kwargs.set_item("as_spk", false)?;
-        let ve_embeds = ve.call_method("embeds_from_wavs", (wavs_list,), Some(&ve_kwargs))?;
-
-        let ve_embed = torch.call_method1("from_numpy", (ve_embeds,))?;
-        let mean_kwargs = PyDict::new(py);
-        mean_kwargs.set_item("dim", 0)?;
-        mean_kwargs.set_item("keepdim", true)?;
-        let ve_embed = ve_embed.call_method("mean", (), Some(&mean_kwargs))?;
-        let ve_embed = ve_embed.call_method1("to", (device_str,))?;
+        // Voice-encoder speaker embedding (Rust)
+        let ref_16k = self.s3gen_rs.resample_to_16k(&s3gen_ref_tch)?;
+        let ve_embeds = self.voice_encoder.embeds_from_wavs(
+            &[ref_16k],
+            S3_SR as i64,
+            false,
+            Some(20.0),
+            Some(32),
+        )?;
+        let ve_embed = ve_embeds.mean_dim(&[0_i64][..], true, TchKind::Float);
+        let ve_embed = tch_tensor_to_py_with_dtype(py, &ve_embed, "float32")?;
+        let ve_embed = ve_embed.bind(py).call_method1("to", (device_str,))?;
 
         let t3_tokens_bound = t3_cond_prompt_tokens.as_ref().map(|t| t.bind(py));
         let t3_cond = match t3_tokens_bound {
