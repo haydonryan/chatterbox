@@ -16,6 +16,8 @@ pub enum ChatterboxError {
     ShapeMismatch(String),
     /// Not implemented yet
     NotImplemented(&'static str),
+    /// Tensor conversion error
+    TensorConversion(String),
     /// Conditionals not prepared before generate
     ConditionalsNotPrepared,
     /// Invalid device specification
@@ -33,6 +35,7 @@ impl fmt::Display for ChatterboxError {
             ChatterboxError::MissingWeight(name) => write!(f, "Missing weight: {}", name),
             ChatterboxError::ShapeMismatch(msg) => write!(f, "Shape mismatch: {}", msg),
             ChatterboxError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
+            ChatterboxError::TensorConversion(msg) => write!(f, "Tensor conversion error: {}", msg),
             ChatterboxError::ConditionalsNotPrepared => {
                 write!(f, "Conditionals not prepared. Call prepare_conditionals() or provide audio_prompt_path")
             }

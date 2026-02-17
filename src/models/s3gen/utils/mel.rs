@@ -8,7 +8,7 @@ fn mel_to_hz(mel: f64) -> f64 {
     700.0 * (mel / 1127.0).exp() - 700.0
 }
 
-fn mel_filterbank(
+pub(crate) fn mel_filterbank(
     n_fft: i64,
     n_mels: i64,
     sample_rate: i64,
@@ -98,7 +98,7 @@ pub fn mel_spectrogram(
         Some(hop_size),
         Some(win_size),
         Some(&window),
-        center,
+        false,
         "reflect",
         false,
         true,

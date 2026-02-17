@@ -8,11 +8,13 @@ pub mod utils;
 pub mod weights;
 pub mod tokenizer;
 pub mod speaker_encoder;
+pub mod hifigan;
+pub mod flow;
 
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
-use crate::error::{ChatterboxError, Result};
+use crate::error::Result;
 
 /// Output sample rate for S3Gen (24kHz).
 pub const S3GEN_SR: u32 = 24000;
@@ -110,6 +112,8 @@ pub struct S3Gen {
     meanflow: bool,
     dtype: Kind,
     tokenizer: tokenizer::S3Tokenizer,
+    hifigan: hifigan::HiFTGenerator,
+    flow: flow::CausalMaskedDiffWithXvec,
 }
 
 impl S3Gen {
@@ -121,12 +125,16 @@ impl S3Gen {
     ) -> Result<Self> {
         let weights = weights::Weights::load(path, device)?;
         let tokenizer = tokenizer::S3Tokenizer::from_weights(&weights, device)?;
+        let hifigan = hifigan::HiFTGenerator::from_weights(&weights)?;
+        let flow = flow::CausalMaskedDiffWithXvec::from_weights(&weights)?;
         Ok(Self {
             weights,
             device,
             meanflow,
             dtype: Kind::Float,
             tokenizer,
+            hifigan,
+            flow,
         })
     }
 
@@ -155,9 +163,27 @@ impl S3Gen {
         _ref_dict: &S3GenRef,
         _options: &S3GenInferenceOptions,
     ) -> Result<(Tensor, Tensor)> {
-        Err(ChatterboxError::NotImplemented(
-            "S3Gen Rust inference is not implemented yet",
-        ))
+        let ref_dict = _ref_dict.to_device(self.device);
+        let mut speech_tokens = _speech_tokens.to_device(self.device);
+        if _options.drop_invalid_tokens {
+            let mask = speech_tokens.lt(SPEECH_VOCAB_SIZE);
+            speech_tokens = speech_tokens.masked_select(&mask);
+        }
+
+        if speech_tokens.dim() == 1 {
+            speech_tokens = speech_tokens.unsqueeze(0);
+        }
+
+        let n_timesteps = _options.n_cfm_timesteps;
+        let mel = self.flow_inference(&speech_tokens, &ref_dict, true, n_timesteps)?;
+        if std::env::var("S3GEN_DEBUG").is_ok() {
+            debug_stats("flow_mel", &mel);
+        }
+        let wav = self.hift_inference(&mel)?;
+        if std::env::var("S3GEN_DEBUG").is_ok() {
+            debug_stats("hifigan_wav", &wav);
+        }
+        Ok((wav, Tensor::zeros([1, 1, 0], (Kind::Float, self.device))))
     }
 
     /// Run flow inference (token -> mel).
@@ -170,22 +196,52 @@ impl S3Gen {
         _finalize: bool,
         _n_cfm_timesteps: Option<i64>,
     ) -> Result<Tensor> {
-        Err(ChatterboxError::NotImplemented(
-            "S3Gen Rust flow inference is not implemented yet",
-        ))
+        let ref_dict = _ref_dict.to_device(self.device);
+        let tokens = if _speech_tokens.dim() == 1 {
+            _speech_tokens.to_device(self.device).unsqueeze(0)
+        } else {
+            _speech_tokens.to_device(self.device)
+        };
+        let token_len = Tensor::from_slice(&[tokens.size()[1]]).to_device(self.device);
+        let prompt_token = ref_dict.prompt_token.to_device(self.device);
+        let prompt_token_len = ref_dict.prompt_token_len.to_device(self.device);
+        let prompt_feat = ref_dict.prompt_feat.to_device(self.device);
+        let embedding = ref_dict.embedding.to_device(self.device);
+        let (mel, _cache) = self.flow.inference(
+            &tokens,
+            &token_len,
+            &prompt_token,
+            &prompt_token_len,
+            &prompt_feat,
+            &embedding,
+            _finalize,
+            _n_cfm_timesteps,
+        )?;
+        Ok(mel)
     }
 
     /// Run HiFiGAN vocoder inference (mel -> waveform).
     ///
     /// NOTE: full Rust implementation is in-progress.
     pub fn hift_inference(&self, _speech_feat: &Tensor) -> Result<Tensor> {
-        Err(ChatterboxError::NotImplemented(
-            "S3Gen Rust HiFiGAN inference is not implemented yet",
-        ))
+        let (wav, _source) = self.hifigan.inference(_speech_feat, &Tensor::zeros([1, 1, 0], (Kind::Float, self.device)));
+        Ok(wav)
     }
 
     /// Access raw weights (for module implementations).
     pub fn weights(&self) -> &weights::Weights {
         &self.weights
     }
+}
+
+fn debug_stats(name: &str, tensor: &Tensor) {
+    let t = tensor.to_device(Device::Cpu).to_kind(Kind::Float);
+    let mean = t.mean(Kind::Float).double_value(&[]);
+    let min = t.min().double_value(&[]);
+    let max = t.max().double_value(&[]);
+    let shape = t.size();
+    eprintln!(
+        "[S3GEN_DEBUG] {} shape={:?} mean={:.6} min={:.6} max={:.6}",
+        name, shape, mean, min, max
+    );
 }

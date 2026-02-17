@@ -4,7 +4,8 @@ use pyo3::types::{PyDict, PyList, PySlice};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChatterboxError, Result};
-use crate::models::{EnTokenizer, T3, T3Cond, VoiceEncoder};
+use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3, T3Cond, VoiceEncoder};
+use tch::{Device as TchDevice, Kind as TchKind, Tensor as TchTensor};
 
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
@@ -87,6 +88,14 @@ impl Device {
             Device::Cpu => "cpu",
             Device::Cuda => "cuda",
             Device::Mps => "mps",
+        }
+    }
+
+    pub fn to_tch_device(&self) -> TchDevice {
+        match self {
+            Device::Cpu => TchDevice::Cpu,
+            Device::Cuda => TchDevice::Cuda(0),
+            Device::Mps => TchDevice::Mps,
         }
     }
 
@@ -394,6 +403,8 @@ pub struct ChatterboxTTS {
     device: Device,
     /// Tokenizer used for text preprocessing
     tokenizer: EnTokenizer,
+    /// Rust-native S3Gen inference
+    s3gen_rs: S3Gen,
 }
 
 impl ChatterboxTTS {
@@ -522,6 +533,8 @@ impl ChatterboxTTS {
         s3gen.call_method1("to", (device_str,))?;
         s3gen.call_method0("eval")?;
 
+        let s3gen_rs = S3Gen::from_safetensors(&s3gen_path, device.to_tch_device(), false)?;
+
         println!("[DEBUG] Loading EnTokenizer...");
         let tokenizer_path = ckpt_dir.join("tokenizer.json");
         let tokenizer = EnTokenizer::new(py, &tokenizer_path)?;
@@ -554,6 +567,7 @@ impl ChatterboxTTS {
             inner: instance.into(),
             device,
             tokenizer,
+            s3gen_rs,
         })
     }
 
@@ -790,20 +804,38 @@ impl ChatterboxTTS {
         speech_tokens = speech_tokens.call_method1(py, "__getitem__", (mask,))?;
         speech_tokens = speech_tokens.call_method1(py, "to", (device_str,))?;
 
-        let s3gen = self.inner.getattr(py, "s3gen")?;
-        let s3gen_kwargs = PyDict::new(py);
-        s3gen_kwargs.set_item("speech_tokens", speech_tokens)?;
-        s3gen_kwargs.set_item("ref_dict", conds.getattr(py, "gen")?)?;
-
-        let s3gen_out = s3gen.call_method(py, "inference", (), Some(&s3gen_kwargs))?;
-        let mut wav = s3gen_out.bind(py).get_item(0)?.unbind();
-        wav = wav.call_method1(py, "squeeze", (0,))?;
-        wav = wav.call_method0(py, "detach")?;
-        wav = wav.call_method0(py, "cpu")?;
-        let wav = wav.call_method1(py, "unsqueeze", (0,))?;
+        let gen_any = conds.getattr(py, "gen")?;
+        let gen_dict = gen_any.bind(py);
+        let ref_dict = self.py_ref_to_s3gen(py, &gen_dict)?;
+        let tokens_tch = py_tensor_to_tch(py, &speech_tokens.bind(py))?;
+        let wav_tch = self
+            .s3gen_rs
+            .inference(&tokens_tch, &ref_dict, &S3GenInferenceOptions::default())?
+            .0;
+        let wav = tch_tensor_to_py(py, &wav_tch)?;
 
         let sr = self.sample_rate(py)?;
         Ok(AudioOutput::from_tensor(wav, sr))
+    }
+
+    fn py_ref_to_s3gen(&self, py: Python<'_>, gen_dict: &Bound<'_, PyAny>) -> Result<S3GenRef> {
+        let prompt_token = gen_dict.get_item("prompt_token")?;
+        let prompt_token_len = gen_dict.get_item("prompt_token_len")?;
+        let prompt_feat = gen_dict.get_item("prompt_feat")?;
+        let embedding = gen_dict.get_item("embedding")?;
+
+        let prompt_token = py_tensor_to_tch(py, &prompt_token)?;
+        let prompt_token_len = py_tensor_to_tch(py, &prompt_token_len)?;
+        let prompt_feat = py_tensor_to_tch(py, &prompt_feat)?;
+        let embedding = py_tensor_to_tch(py, &embedding)?;
+
+        Ok(S3GenRef::new(
+            prompt_token,
+            prompt_token_len,
+            prompt_feat,
+            None,
+            embedding,
+        ))
     }
 
     /// Simple generation with default options
@@ -824,6 +856,39 @@ impl ChatterboxTTS {
             .audio_prompt_path(voice_path.to_string_lossy());
         self.generate(py, text, opts)
     }
+}
+
+fn py_tensor_to_tch(py: Python<'_>, tensor: &Bound<'_, PyAny>) -> Result<TchTensor> {
+    let tensor = tensor.call_method0("detach")?.call_method0("cpu")?;
+    let numpy = tensor.call_method0("numpy")?;
+    let dtype: String = numpy.getattr("dtype")?.getattr("name")?.extract()?;
+    let shape: Vec<i64> = numpy.getattr("shape")?.extract()?;
+    let flat = numpy.call_method0("ravel")?;
+
+    let tch = if dtype.starts_with("int") || dtype.starts_with("uint") {
+        let data: Vec<i64> = flat.extract()?;
+        TchTensor::from_slice(&data).reshape(&shape)
+    } else {
+        let data: Vec<f32> = flat.extract()?;
+        TchTensor::from_slice(&data).reshape(&shape)
+    };
+    Ok(tch)
+}
+
+fn tch_tensor_to_py(py: Python<'_>, tensor: &TchTensor) -> Result<Py<PyAny>> {
+    let tensor = tensor.to_device(TchDevice::Cpu).to_kind(TchKind::Float);
+    let shape: Vec<i64> = tensor.size();
+    let flat = tensor.contiguous().view([-1]);
+    let data: Vec<f32> = Vec::<f32>::try_from(&flat).map_err(|e| {
+        ChatterboxError::TensorConversion(format!("tch tensor -> vec failed: {e}"))
+    })?;
+
+    let numpy = py.import("numpy")?;
+    let array = numpy.call_method1("array", (data,))?;
+    let array = array.call_method1("reshape", (shape,))?;
+    let torch = py.import("torch")?;
+    let out = torch.call_method1("from_numpy", (array,))?;
+    Ok(out.into())
 }
 
 /// Utility function to print device and environment info

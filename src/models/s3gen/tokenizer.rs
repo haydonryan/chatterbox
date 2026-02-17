@@ -2,6 +2,7 @@ use tch::{Device, IndexOp, Kind, Tensor};
 
 use crate::error::{ChatterboxError, Result};
 use crate::models::s3gen::weights::Weights;
+use crate::models::s3gen::utils::mel::mel_filterbank;
 
 const N_MELS: i64 = 128;
 const N_AUDIO_STATE: i64 = 1280;
@@ -21,8 +22,20 @@ pub struct S3Tokenizer {
 
 impl S3Tokenizer {
     pub fn from_weights(weights: &Weights, device: Device) -> Result<Self> {
-        let mel_filters = weights.get("tokenizer._mel_filters")?;
-        let window = weights.get("tokenizer.window")?;
+        let mel_filters = match weights.get("tokenizer._mel_filters") {
+            Ok(t) => t,
+            Err(ChatterboxError::MissingWeight(_)) => {
+                mel_filterbank(N_FFT, N_MELS, 16_000, 0.0, 8_000.0, device)
+            }
+            Err(e) => return Err(e),
+        };
+        let window = match weights.get("tokenizer.window") {
+            Ok(t) => t,
+            Err(ChatterboxError::MissingWeight(_)) => {
+                Tensor::hann_window(N_FFT, (Kind::Float, device))
+            }
+            Err(e) => return Err(e),
+        };
         let encoder = AudioEncoderV2::from_weights(weights)?;
         let quantizer = FSQVectorQuantization::from_weights(weights)?;
 
@@ -76,13 +89,15 @@ impl S3Tokenizer {
         if padding > 0 {
             audio = audio.pad(&[0, padding], "constant", Some(0.0));
         }
+        let pad = N_FFT / 2;
+        audio = audio.pad(&[pad, pad], "reflect", None);
         let window = self.window.to_device(self.device);
         let stft = audio.stft_center(
             N_FFT,
             Some(HOP_SIZE),
             Some(N_FFT),
             Some(&window),
-            true,
+            false,
             "reflect",
             false,
             true,
