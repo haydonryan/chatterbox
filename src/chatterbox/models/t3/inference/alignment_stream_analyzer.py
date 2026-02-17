@@ -1,10 +1,10 @@
 # Copyright (c) 2025 Resemble AI
 # Author: John Meade, Jeremy Hsu
 # MIT License
+# NOTE: Rust implementation available at src/models/t3/inference/alignment_stream_analyzer.rs
 import logging
 import torch
 from dataclasses import dataclass
-from types import MethodType
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class AlignmentStreamAnalyzer:
 
         self.complete = False
         self.completed_at = None
-        
+
         # Track generated tokens for repetition detection
         self.generated_tokens = []
 
@@ -137,7 +137,7 @@ class AlignmentStreamAnalyzer:
 
         # If there are activations in previous tokens after generation has completed, assume this is a repetition error.
         alignment_repetition = self.complete and (A[self.completed_at:, :-5].max(dim=1).values.sum() > 5)
-        
+
         # Track generated tokens for repetition detection
         if next_token is not None:
             # Convert tensor to scalar if needed
@@ -146,22 +146,22 @@ class AlignmentStreamAnalyzer:
             else:
                 token_id = next_token
             self.generated_tokens.append(token_id)
-            
+
             # Keep only last 8 tokens to prevent memory issues
             if len(self.generated_tokens) > 8:
                 self.generated_tokens = self.generated_tokens[-8:]
-            
+
         # Check for excessive token repetition (3x same token in a row)
         token_repetition = (
-            # self.complete and 
+            # self.complete and
             len(self.generated_tokens) >= 3 and
             len(set(self.generated_tokens[-2:])) == 1
         )
-        
+
         if token_repetition:
             repeated_token = self.generated_tokens[-1]
-            logger.warning(f"🚨 Detected 2x repetition of token {repeated_token}")
-            
+            logger.warning(f"Detected 2x repetition of token {repeated_token}")
+
         # Suppress EoS to prevent early termination
         if cur_text_posn < S - 3 and S > 5:  # Only suppress if text is longer than 5 tokens
             logits[..., self.eos_idx] = -2**15

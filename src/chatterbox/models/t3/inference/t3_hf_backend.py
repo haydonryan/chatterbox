@@ -1,3 +1,4 @@
+# NOTE: Rust implementation available at src/models/t3/inference/t3_hf_backend.rs
 from typing import Optional
 
 import torch
