@@ -10,6 +10,56 @@ use crate::models::{T3, T3Cond, VoiceEncoder};
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
 pub const S3_SR: u32 = 16000; // Input sample rate for conditioning
 
+/// Quick cleanup func for punctuation from LLMs or containing chars not seen often in the dataset.
+pub fn punc_norm(text: &str) -> String {
+    if text.is_empty() {
+        return "You need to add some text for me to talk.".to_string();
+    }
+
+    let mut text = text.to_string();
+
+    // Capitalise first letter
+    if let Some(first) = text.chars().next() {
+        if first.is_lowercase() {
+            let mut out = String::new();
+            out.extend(first.to_uppercase());
+            out.push_str(&text[first.len_utf8()..]);
+            text = out;
+        }
+    }
+
+    // Remove multiple space chars
+    text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Replace uncommon/LLM punctuation
+    let punc_to_replace = [
+        ("...", ", "),
+        ("…", ", "),
+        (":", ","),
+        (" - ", ", "),
+        (";", ", "),
+        ("—", "-"),
+        ("–", "-"),
+        (" ,", ","),
+        ("“", "\""),
+        ("”", "\""),
+        ("‘", "'"),
+        ("’", "'"),
+    ];
+    for (old, new) in punc_to_replace {
+        text = text.replace(old, new);
+    }
+
+    // Add full stop if no ending punc
+    text = text.trim_end_matches(' ').to_string();
+    let sentence_enders = [".", "!", "?", "-", ","];
+    if !sentence_enders.iter().any(|p| text.ends_with(p)) {
+        text.push('.');
+    }
+
+    text
+}
+
 // HuggingFace repo ID for model weights
 const REPO_ID: &str = "ResembleAI/chatterbox";
 
@@ -569,19 +619,111 @@ impl ChatterboxTTS {
     /// # Returns
     /// An `AudioOutput` containing the generated waveform tensor
     pub fn generate(&self, py: Python<'_>, text: &str, options: GenerateOptions) -> Result<AudioOutput> {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("repetition_penalty", options.repetition_penalty)?;
-        kwargs.set_item("min_p", options.min_p)?;
-        kwargs.set_item("top_p", options.top_p)?;
-        kwargs.set_item("exaggeration", options.exaggeration)?;
-        kwargs.set_item("cfg_weight", options.cfg_weight)?;
-        kwargs.set_item("temperature", options.temperature)?;
+        let device_str = self.device.as_str();
+        let torch = py.import("torch")?.unbind();
+        let torch_fn = py.import("torch.nn.functional")?.unbind();
+        let s3tokenizer_mod = py.import("chatterbox.models.s3tokenizer")?.unbind();
+        let drop_invalid_tokens = s3tokenizer_mod.getattr(py, "drop_invalid_tokens")?;
 
         if let Some(ref path) = options.audio_prompt_path {
-            kwargs.set_item("audio_prompt_path", path)?;
+            self.prepare_conditionals(py, Path::new(path), Some(options.exaggeration))?;
+        } else {
+            let conds = self.inner.getattr(py, "conds")?;
+            if conds.is_none(py) {
+                return Err(ChatterboxError::ConditionalsNotPrepared);
+            }
         }
 
-        let wav = self.inner.call_method(py, "generate", (text,), Some(&kwargs))?;
+        let conds = self.inner.getattr(py, "conds")?;
+        let t3_cond = conds.getattr(py, "t3")?;
+
+        // Update exaggeration if needed
+        let emotion_adv = t3_cond.getattr(py, "emotion_adv")?;
+        let current_exag: f32 = emotion_adv
+            .bind(py)
+            .get_item((0, 0, 0))?
+            .extract()?;
+        if options.exaggeration != current_exag {
+            let speaker_emb = t3_cond.getattr(py, "speaker_emb")?;
+            let cond_prompt_speech_tokens = t3_cond.getattr(py, "cond_prompt_speech_tokens")?;
+            let cond_tokens = if cond_prompt_speech_tokens.is_none(py) {
+                None
+            } else {
+                Some(cond_prompt_speech_tokens.bind(py))
+            };
+
+            let speaker_emb = speaker_emb.bind(py);
+            let new_t3_cond = match cond_tokens {
+                Some(ref tokens) => T3Cond::new(py, &speaker_emb, Some(tokens), Some(options.exaggeration))?,
+                None => T3Cond::new(py, &speaker_emb, None, Some(options.exaggeration))?,
+            };
+            let new_t3_cond = new_t3_cond.to_device(py, device_str)?;
+            conds.setattr(py, "t3", new_t3_cond.as_py())?;
+        }
+
+        // Norm and tokenize text
+        let text = punc_norm(text);
+        let tokenizer = self.inner.getattr(py, "tokenizer")?;
+        let mut text_tokens = tokenizer
+            .call_method1(py, "text_to_tokens", (text.as_str(),))?
+            .call_method1(py, "to", (device_str,))?;
+
+        if options.cfg_weight > 0.0 {
+            let cat_inputs = PyList::new(py, &[text_tokens.clone_ref(py), text_tokens.clone_ref(py)])?;
+            let cat_kwargs = PyDict::new(py);
+            cat_kwargs.set_item("dim", 0)?;
+            text_tokens = torch.call_method(py, "cat", (cat_inputs,), Some(&cat_kwargs))?;
+        }
+
+        let t3 = self.inner.getattr(py, "t3")?;
+        let hp = t3.getattr(py, "hp")?;
+        let sot: i64 = hp.getattr(py, "start_text_token")?.extract(py)?;
+        let eot: i64 = hp.getattr(py, "stop_text_token")?.extract(py)?;
+
+        let pad_kwargs = PyDict::new(py);
+        pad_kwargs.set_item("value", sot)?;
+        text_tokens = torch_fn.call_method(py, "pad", (text_tokens, (1, 0)), Some(&pad_kwargs))?;
+
+        let pad_kwargs = PyDict::new(py);
+        pad_kwargs.set_item("value", eot)?;
+        text_tokens = torch_fn.call_method(py, "pad", (text_tokens, (0, 1)), Some(&pad_kwargs))?;
+
+        let inference_mode = torch.call_method0(py, "inference_mode")?;
+        inference_mode.call_method0(py, "__enter__")?;
+        let speech_tokens_result = (|| -> PyResult<Py<PyAny>> {
+            let t3_cond = conds.getattr(py, "t3")?;
+            let t3_kwargs = PyDict::new(py);
+            t3_kwargs.set_item("t3_cond", t3_cond)?;
+            t3_kwargs.set_item("text_tokens", text_tokens)?;
+            t3_kwargs.set_item("max_new_tokens", 1000)?;
+            t3_kwargs.set_item("temperature", options.temperature)?;
+            t3_kwargs.set_item("cfg_weight", options.cfg_weight)?;
+            t3_kwargs.set_item("repetition_penalty", options.repetition_penalty)?;
+            t3_kwargs.set_item("min_p", options.min_p)?;
+            t3_kwargs.set_item("top_p", options.top_p)?;
+
+            let speech_tokens = t3.call_method(py, "inference", (), Some(&t3_kwargs))?;
+            Ok(speech_tokens.bind(py).get_item(0)?.unbind())
+        })();
+        inference_mode.call_method1(py, "__exit__", (py.None(), py.None(), py.None()))?;
+        let mut speech_tokens = speech_tokens_result?;
+
+        speech_tokens = drop_invalid_tokens.call1(py, (speech_tokens,))?;
+        let mask = speech_tokens.call_method1(py, "__lt__", (6561,))?;
+        speech_tokens = speech_tokens.call_method1(py, "__getitem__", (mask,))?;
+        speech_tokens = speech_tokens.call_method1(py, "to", (device_str,))?;
+
+        let s3gen = self.inner.getattr(py, "s3gen")?;
+        let s3gen_kwargs = PyDict::new(py);
+        s3gen_kwargs.set_item("speech_tokens", speech_tokens)?;
+        s3gen_kwargs.set_item("ref_dict", conds.getattr(py, "gen")?)?;
+
+        let s3gen_out = s3gen.call_method(py, "inference", (), Some(&s3gen_kwargs))?;
+        let mut wav = s3gen_out.bind(py).get_item(0)?.unbind();
+        wav = wav.call_method1(py, "squeeze", (0,))?;
+        wav = wav.call_method0(py, "detach")?;
+        wav = wav.call_method0(py, "cpu")?;
+        let wav = wav.call_method1(py, "unsqueeze", (0,))?;
 
         let sr = self.sample_rate(py)?;
         Ok(AudioOutput::from_tensor(wav, sr))

@@ -18,46 +18,46 @@ from .models.t3.modules.cond_enc import T3Cond
 REPO_ID = "ResembleAI/chatterbox"
 
 
-def punc_norm(text: str) -> str:
-    """
-        Quick cleanup func for punctuation from LLMs or
-        containing chars not seen often in the dataset
-    """
-    if len(text) == 0:
-        return "You need to add some text for me to talk."
-
-    # Capitalise first letter
-    if text[0].islower():
-        text = text[0].upper() + text[1:]
-
-    # Remove multiple space chars
-    text = " ".join(text.split())
-
-    # Replace uncommon/llm punc
-    punc_to_replace = [
-        ("...", ", "),
-        ("…", ", "),
-        (":", ","),
-        (" - ", ", "),
-        (";", ", "),
-        ("—", "-"),
-        ("–", "-"),
-        (" ,", ","),
-        ("“", "\""),
-        ("”", "\""),
-        ("‘", "'"),
-        ("’", "'"),
-    ]
-    for old_char_sequence, new_char in punc_to_replace:
-        text = text.replace(old_char_sequence, new_char)
-
-    # Add full stop if no ending punc
-    text = text.rstrip(" ")
-    sentence_enders = {".", "!", "?", "-", ","}
-    if not any(text.endswith(p) for p in sentence_enders):
-        text += "."
-
-    return text
+# def punc_norm(text: str) -> str:
+#     """
+#         Quick cleanup func for punctuation from LLMs or
+#         containing chars not seen often in the dataset
+#     """
+#     if len(text) == 0:
+#         return "You need to add some text for me to talk."
+#
+#     # Capitalise first letter
+#     if text[0].islower():
+#         text = text[0].upper() + text[1:]
+#
+#     # Remove multiple space chars
+#     text = " ".join(text.split())
+#
+#     # Replace uncommon/llm punc
+#     punc_to_replace = [
+#         ("...", ", "),
+#         ("…", ", "),
+#         (":", ","),
+#         (" - ", ", "),
+#         (";", ", "),
+#         ("—", "-"),
+#         ("–", "-"),
+#         (" ,", ","),
+#         ("“", "\""),
+#         ("”", "\""),
+#         ("‘", "'"),
+#         ("’", "'"),
+#     ]
+#     for old_char_sequence, new_char in punc_to_replace:
+#         text = text.replace(old_char_sequence, new_char)
+#
+#     # Add full stop if no ending punc
+#     text = text.rstrip(" ")
+#     sentence_enders = {".", "!", "?", "-", ","}
+#     if not any(text.endswith(p) for p in sentence_enders):
+#         text += "."
+#
+#     return text
 
 
 @dataclass
@@ -203,67 +203,67 @@ class ChatterboxTTS:
 #        ).to(device=self.device)
 #        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
-    def generate(
-        self,
-        text,
-        repetition_penalty=1.2,
-        min_p=0.05,
-        top_p=1.0,
-        audio_prompt_path=None,
-        exaggeration=0.5,
-        cfg_weight=0.5,
-        temperature=0.8,
-    ):
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-        else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
-
-        # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond: T3Cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
-
-        # Norm and tokenize text
-        text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
-
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
-
-        sot = self.t3.hp.start_text_token
-        eot = self.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
-
-        with torch.inference_mode():
-            speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=1000,  # TODO: use the value in config
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-            )
-            # Extract only the conditional batch.
-            speech_tokens = speech_tokens[0]
-
-            # TODO: output becomes 1D
-            speech_tokens = drop_invalid_tokens(speech_tokens)
-            
-            speech_tokens = speech_tokens[speech_tokens < 6561]
-
-            speech_tokens = speech_tokens.to(self.device)
-
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
-            )
-            wav = wav.squeeze(0).detach().cpu()
-        return wav.unsqueeze(0)
+#    def generate(
+#        self,
+#        text,
+#        repetition_penalty=1.2,
+#        min_p=0.05,
+#        top_p=1.0,
+#        audio_prompt_path=None,
+#        exaggeration=0.5,
+#        cfg_weight=0.5,
+#        temperature=0.8,
+#    ):
+#        if audio_prompt_path:
+#            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+#        else:
+#            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+#
+#        # Update exaggeration if needed
+#        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+#            _cond: T3Cond = self.conds.t3
+#            self.conds.t3 = T3Cond(
+#                speaker_emb=_cond.speaker_emb,
+#                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+#                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+#            ).to(device=self.device)
+#
+#        # Norm and tokenize text
+#        text = punc_norm(text)
+#        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+#
+#        if cfg_weight > 0.0:
+#            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+#
+#        sot = self.t3.hp.start_text_token
+#        eot = self.t3.hp.stop_text_token
+#        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+#        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+#
+#        with torch.inference_mode():
+#            speech_tokens = self.t3.inference(
+#                t3_cond=self.conds.t3,
+#                text_tokens=text_tokens,
+#                max_new_tokens=1000,  # TODO: use the value in config
+#                temperature=temperature,
+#                cfg_weight=cfg_weight,
+#                repetition_penalty=repetition_penalty,
+#                min_p=min_p,
+#                top_p=top_p,
+#            )
+#            # Extract only the conditional batch.
+#            speech_tokens = speech_tokens[0]
+#
+#            # TODO: output becomes 1D
+#            speech_tokens = drop_invalid_tokens(speech_tokens)
+#
+#            speech_tokens = speech_tokens[speech_tokens < 6561]
+#
+#            speech_tokens = speech_tokens.to(self.device)
+#
+#            wav, _ = self.s3gen.inference(
+#                speech_tokens=speech_tokens,
+#                ref_dict=self.conds.gen,
+#            )
+#            wav = wav.squeeze(0).detach().cpu()
+#        return wav.unsqueeze(0)
