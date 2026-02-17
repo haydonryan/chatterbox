@@ -7,4 +7,5 @@ __version__ = version("chatterbox-tts")
 
 
 from .vc import ChatterboxVC
-from .mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
+# Reenaable if decide to make multi-lingual
+#from .mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES

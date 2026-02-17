@@ -4,7 +4,7 @@ use pyo3::types::{PyDict, PyList, PySlice};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChatterboxError, Result};
-use crate::models::{T3, T3Cond, VoiceEncoder};
+use crate::models::{EnTokenizer, T3, T3Cond, VoiceEncoder};
 
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
@@ -392,6 +392,8 @@ pub struct ChatterboxTTS {
     inner: Py<PyAny>,
     /// Device the model is loaded on
     device: Device,
+    /// Tokenizer used for text preprocessing
+    tokenizer: EnTokenizer,
 }
 
 impl ChatterboxTTS {
@@ -477,9 +479,7 @@ impl ChatterboxTTS {
 
         // Import model classes
         let s3gen_mod = py.import("chatterbox.models.s3gen")?;
-        let tokenizers_mod = py.import("chatterbox.models.tokenizers")?;
         let s3gen_class = s3gen_mod.getattr("S3Gen")?;
-        let en_tokenizer_class = tokenizers_mod.getattr("EnTokenizer")?;
 
         let device_str = device.as_str();
 
@@ -524,7 +524,7 @@ impl ChatterboxTTS {
 
         println!("[DEBUG] Loading EnTokenizer...");
         let tokenizer_path = ckpt_dir.join("tokenizer.json");
-        let tokenizer = en_tokenizer_class.call1((tokenizer_path.to_string_lossy().as_ref(),))?;
+        let tokenizer = EnTokenizer::new(py, &tokenizer_path)?;
 
         // Load conditionals if conds.pt exists
         let conds_path = ckpt_dir.join("conds.pt");
@@ -545,7 +545,7 @@ impl ChatterboxTTS {
         ns_kwargs.set_item("t3", t3.as_py())?;
         ns_kwargs.set_item("s3gen", s3gen)?;
         ns_kwargs.set_item("ve", ve.as_py())?;
-        ns_kwargs.set_item("tokenizer", tokenizer)?;
+        ns_kwargs.set_item("tokenizer", tokenizer.as_py())?;
         ns_kwargs.set_item("device", device_str)?;
         ns_kwargs.set_item("conds", conds)?;
         let instance = ns_class.call((), Some(&ns_kwargs))?;
@@ -553,6 +553,7 @@ impl ChatterboxTTS {
         Ok(Self {
             inner: instance.into(),
             device,
+            tokenizer,
         })
     }
 
@@ -739,9 +740,9 @@ impl ChatterboxTTS {
 
         // Norm and tokenize text
         let text = punc_norm(text);
-        let tokenizer = self.inner.getattr(py, "tokenizer")?;
-        let mut text_tokens = tokenizer
-            .call_method1(py, "text_to_tokens", (text.as_str(),))?
+        let mut text_tokens = self
+            .tokenizer
+            .text_to_tokens(py, text.as_str())?
             .call_method1(py, "to", (device_str,))?;
 
         if options.cfg_weight > 0.0 {
