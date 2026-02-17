@@ -478,11 +478,8 @@ impl ChatterboxTTS {
         // Import model classes
         let s3gen_mod = py.import("chatterbox.models.s3gen")?;
         let tokenizers_mod = py.import("chatterbox.models.tokenizers")?;
-        let tts_mod = py.import("chatterbox.tts")?;
-
         let s3gen_class = s3gen_mod.getattr("S3Gen")?;
         let en_tokenizer_class = tokenizers_mod.getattr("EnTokenizer")?;
-        let chatterbox_class = tts_mod.getattr("ChatterboxTTS")?;
 
         let device_str = device.as_str();
 
@@ -541,10 +538,17 @@ impl ChatterboxTTS {
         };
 
         println!("[DEBUG] Creating ChatterboxTTS instance...");
-        // Create the ChatterboxTTS instance directly
-        // Pass the inner Python objects from Rust wrappers
-        let instance =
-            chatterbox_class.call1((t3.as_py(), s3gen, ve.as_py(), tokenizer, device_str, conds))?;
+        let types = py.import("types")?;
+        let ns_class = types.getattr("SimpleNamespace")?;
+        let ns_kwargs = PyDict::new(py);
+        ns_kwargs.set_item("sr", S3GEN_SR)?;
+        ns_kwargs.set_item("t3", t3.as_py())?;
+        ns_kwargs.set_item("s3gen", s3gen)?;
+        ns_kwargs.set_item("ve", ve.as_py())?;
+        ns_kwargs.set_item("tokenizer", tokenizer)?;
+        ns_kwargs.set_item("device", device_str)?;
+        ns_kwargs.set_item("conds", conds)?;
+        let instance = ns_class.call((), Some(&ns_kwargs))?;
 
         Ok(Self {
             inner: instance.into(),
