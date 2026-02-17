@@ -123,50 +123,130 @@ impl std::fmt::Display for Device {
     }
 }
 
-/// Wrapper for Python Conditionals dataclass
+/// Conditioning information for T3 and S3Gen models.
 ///
-/// Holds conditioning information for T3 and S3Gen models:
+/// Mirrors the Python Conditionals dataclass:
 /// - T3: speaker embedding, speech tokens, emotion
 /// - S3Gen: prompt tokens, features, embedding
 pub struct Conditionals {
-    inner: Py<PyAny>,
+    t3: T3Cond,
+    gen_dict: Py<PyAny>,
 }
 
 impl Conditionals {
-    /// Create from an existing Python Conditionals object
-    pub fn from_py(obj: Py<PyAny>) -> Self {
-        Self { inner: obj }
+    /// Create new conditionals from T3Cond and S3Gen reference dict.
+    pub fn new(t3: T3Cond, gen_dict: Py<PyAny>) -> Self {
+        Self { t3, gen_dict }
     }
 
-    /// Get the underlying Python object
-    pub fn as_py(&self) -> &Py<PyAny> {
-        &self.inner
+    /// Create from an existing Python object with `t3` and `gen` attributes.
+    pub fn from_py(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let t3 = obj.getattr("t3")?;
+        let gen_dict = obj.getattr("gen")?;
+        Ok(Self {
+            t3: T3Cond::from_py(t3.unbind()),
+            gen_dict: gen_dict.unbind(),
+        })
     }
 
-    /// Move to a different device
+    /// Access the T3 conditionals.
+    pub fn t3(&self) -> &T3Cond {
+        &self.t3
+    }
+
+    /// Access the S3Gen reference dict.
+    pub fn gen_dict(&self) -> &Py<PyAny> {
+        &self.gen_dict
+    }
+
+    /// Convert to a Python object with `t3` and `gen` attributes.
+    pub fn to_py(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let types = py.import("types")?;
+        let ns_class = types.getattr("SimpleNamespace")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("t3", self.t3.as_py())?;
+        kwargs.set_item("gen", self.gen_dict.bind(py))?;
+        let ns = ns_class.call((), Some(&kwargs))?;
+        Ok(ns.into())
+    }
+
+    /// Move conditionals to a different device.
     pub fn to_device(&self, py: Python<'_>, device: Device) -> Result<Self> {
-        let moved = self.inner.call_method1(py, "to", (device.as_str(),))?;
-        Ok(Self { inner: moved })
+        let device_str = device.as_str();
+        let t3 = self.t3.to_device(py, device_str)?;
+
+        let torch = py.import("torch")?;
+        let gen_dict = self
+            .gen_dict
+            .bind(py)
+            .cast::<PyDict>()
+            .map_err(|e| ChatterboxError::Python(pyo3::exceptions::PyTypeError::new_err(e.to_string())))?;
+        let moved_dict = PyDict::new(py);
+        for (key, value) in gen_dict.iter() {
+            let is_tensor: bool = torch
+                .getattr("is_tensor")?
+                .call1((value.clone(),))?
+                .extract()?;
+            if is_tensor {
+                let moved = value.call_method1("to", (device_str,))?;
+                moved_dict.set_item(key, moved)?;
+            } else {
+                moved_dict.set_item(key, value)?;
+            }
+        }
+
+        Ok(Self {
+            t3,
+            gen_dict: moved_dict.into(),
+        })
     }
 
-    /// Save conditionals to a file
+    /// Save conditionals to a file.
     pub fn save(&self, py: Python<'_>, path: &Path) -> Result<()> {
+        let torch = py.import("torch")?;
         let path_str = path.to_string_lossy();
-        self.inner
-            .call_method1(py, "save", (path_str.as_ref(),))?;
+
+        let arg_dict = PyDict::new(py);
+        let t3_dict = self.t3.as_py().call_method0(py, "__dict__")?;
+        arg_dict.set_item("t3", t3_dict)?;
+        arg_dict.set_item("gen", self.gen_dict.bind(py))?;
+
+        torch.call_method1("save", (arg_dict, path_str.as_ref()))?;
         Ok(())
     }
 
-    /// Load conditionals from a file
+    /// Load conditionals from a file.
     pub fn load(py: Python<'_>, path: &Path, device: Option<Device>) -> Result<Self> {
-        let tts_module = py.import("chatterbox.tts")?;
-        let conditionals_class = tts_module.getattr("Conditionals")?;
+        let torch = py.import("torch")?;
+        let cond_enc_mod = py.import("chatterbox.models.t3.modules.cond_enc")?;
+        let t3_cond_class = cond_enc_mod.getattr("T3Cond")?;
 
         let path_str = path.to_string_lossy();
         let map_location = device.map(|d| d.as_str()).unwrap_or("cpu");
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("map_location", map_location)?;
+        kwargs.set_item("weights_only", true)?;
 
-        let obj = conditionals_class.call_method1("load", (path_str.as_ref(), map_location))?;
-        Ok(Self { inner: obj.into() })
+        let loaded = torch.call_method("load", (path_str.as_ref(),), Some(&kwargs))?;
+        let loaded = loaded
+            .cast::<PyDict>()
+            .map_err(|e| ChatterboxError::Python(pyo3::exceptions::PyTypeError::new_err(e.to_string())))?;
+        let t3_item = loaded.get_item("t3")?.ok_or_else(|| {
+            ChatterboxError::Python(pyo3::exceptions::PyKeyError::new_err("t3"))
+        })?;
+        let t3_kwargs = t3_item
+            .cast::<PyDict>()
+            .map_err(|e| ChatterboxError::Python(pyo3::exceptions::PyTypeError::new_err(e.to_string())))?;
+        let gen_item = loaded.get_item("gen")?.ok_or_else(|| {
+            ChatterboxError::Python(pyo3::exceptions::PyKeyError::new_err("gen"))
+        })?;
+        let gen_dict = gen_item.unbind();
+
+        let t3_cond = t3_cond_class.call((), Some(t3_kwargs))?;
+        Ok(Self {
+            t3: T3Cond::from_py(t3_cond.into()),
+            gen_dict,
+        })
     }
 }
 
@@ -402,17 +482,14 @@ impl ChatterboxTTS {
 
         let s3gen_class = s3gen_mod.getattr("S3Gen")?;
         let en_tokenizer_class = tokenizers_mod.getattr("EnTokenizer")?;
-        let conditionals_class = tts_mod.getattr("Conditionals")?;
         let chatterbox_class = tts_mod.getattr("ChatterboxTTS")?;
 
         let device_str = device.as_str();
 
         // Always load to CPU first for non-CUDA devices to handle CUDA-saved models
-        let map_location = if device == Device::Cpu || device == Device::Mps {
-            Some(torch.call_method1("device", ("cpu",))?)
-        } else {
-            None
-        };
+        if device == Device::Cpu || device == Device::Mps {
+            let _ = torch.call_method1("device", ("cpu",))?;
+        }
 
         // Load VoiceEncoder using Rust wrapper
         println!("[DEBUG] Loading VoiceEncoder...");
@@ -456,23 +533,18 @@ impl ChatterboxTTS {
         let conds_path = ckpt_dir.join("conds.pt");
         let conds = if conds_path.exists() {
             println!("[DEBUG] Loading Conditionals from conds.pt...");
-            let conds_path_str = conds_path.to_string_lossy();
-            let loaded_conds = if let Some(ref map_loc) = map_location {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("map_location", map_loc)?;
-                conditionals_class.call_method("load", (conds_path_str.as_ref(),), Some(&kwargs))?
-            } else {
-                conditionals_class.call_method1("load", (conds_path_str.as_ref(),))?
-            };
-            loaded_conds.call_method1("to", (device_str,))?
+            let loaded_conds = Conditionals::load(py, &conds_path, Some(device))?;
+            let loaded_conds = loaded_conds.to_device(py, device)?;
+            loaded_conds.to_py(py)?
         } else {
-            py.None().into_bound(py)
+            py.None()
         };
 
         println!("[DEBUG] Creating ChatterboxTTS instance...");
         // Create the ChatterboxTTS instance directly
         // Pass the inner Python objects from Rust wrappers
-        let instance = chatterbox_class.call1((t3.as_py(), s3gen, ve.as_py(), tokenizer, device_str, conds))?;
+        let instance =
+            chatterbox_class.call1((t3.as_py(), s3gen, ve.as_py(), tokenizer, device_str, conds))?;
 
         Ok(Self {
             inner: instance.into(),
@@ -497,13 +569,14 @@ impl ChatterboxTTS {
         if conds.is_none(py) {
             Ok(None)
         } else {
-            Ok(Some(Conditionals::from_py(conds)))
+            Ok(Some(Conditionals::from_py(&conds.bind(py))?))
         }
     }
 
     /// Set conditionals directly
     pub fn set_conditionals(&self, py: Python<'_>, conds: &Conditionals) -> Result<()> {
-        self.inner.setattr(py, "conds", conds.as_py())?;
+        let conds_obj = conds.to_py(py)?;
+        self.inner.setattr(py, "conds", conds_obj)?;
         Ok(())
     }
 
@@ -526,8 +599,6 @@ impl ChatterboxTTS {
 
         let librosa = py.import("librosa")?;
         let torch = py.import("torch")?;
-        let tts_mod = py.import("chatterbox.tts")?;
-        let conditionals_class = tts_mod.getattr("Conditionals")?;
 
         let device_str = self.device.as_str();
         let s3gen_obj = self.inner.getattr(py, "s3gen")?;
@@ -605,8 +676,9 @@ impl ChatterboxTTS {
         };
         let t3_cond = t3_cond.to_device(py, device_str)?;
 
-        let conds = conditionals_class.call1((t3_cond.as_py(), s3gen_ref_dict))?;
-        self.inner.setattr(py, "conds", conds)?;
+        let conds = Conditionals::new(t3_cond, s3gen_ref_dict.unbind());
+        let conds_obj = conds.to_py(py)?;
+        self.inner.setattr(py, "conds", conds_obj)?;
         Ok(())
     }
 

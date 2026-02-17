@@ -80,26 +80,26 @@ class Conditionals:
     t3: T3Cond
     gen: dict
 
-    def to(self, device):
-        self.t3 = self.t3.to(device=device)
-        for k, v in self.gen.items():
-            if torch.is_tensor(v):
-                self.gen[k] = v.to(device=device)
-        return self
+ #   def to(self, device):
+ #       self.t3 = self.t3.to(device=device)
+ #       for k, v in self.gen.items():
+ #           if torch.is_tensor(v):
+ #               self.gen[k] = v.to(device=device)
+ #       return self
 
-    def save(self, fpath: Path):
-        arg_dict = dict(
-            t3=self.t3.__dict__,
-            gen=self.gen
-        )
-        torch.save(arg_dict, fpath)
+ #   def save(self, fpath: Path):
+ #       arg_dict = dict(
+ #           t3=self.t3.__dict__,
+ #           gen=self.gen
+ #       )
+ #       torch.save(arg_dict, fpath)
 
-    @classmethod
-    def load(cls, fpath, map_location="cpu"):
-        if isinstance(map_location, str):
-            map_location = torch.device(map_location)
-        kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
-        return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
+#    @classmethod
+#    def load(cls, fpath, map_location="cpu"):
+#        if isinstance(map_location, str):
+#            map_location = torch.device(map_location)
+#        kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
+#        return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 
 class ChatterboxTTS:
