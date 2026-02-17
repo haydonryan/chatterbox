@@ -1,8 +1,9 @@
 use hf_hub::api::sync::Api;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySlice};
+use pyo3::types::{PyDict, PyList};
 use std::path::{Path, PathBuf};
 
+use crate::audio;
 use crate::error::{ChatterboxError, Result};
 use crate::models::s3gen::SPEECH_VOCAB_SIZE;
 use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3, T3Cond, VoiceEncoder};
@@ -385,11 +386,30 @@ impl AudioOutput {
         Ok(data)
     }
 
-    /// Save audio to WAV file using torchaudio
+    /// Save audio to WAV file (Rust implementation).
     pub fn save_wav(&self, py: Python<'_>, path: &Path) -> Result<()> {
-        let torchaudio = py.import("torchaudio")?;
-        let path_str = path.to_string_lossy();
-        torchaudio.call_method1("save", (path_str.as_ref(), &self.tensor, self.sample_rate))?;
+        let (channels, samples) = self.shape(py)?;
+        let data = self.to_vec(py)?;
+        let channels_u16 = u16::try_from(channels).map_err(|_| {
+            ChatterboxError::ShapeMismatch("too many channels for WAV".to_string())
+        })?;
+
+        let out = if channels <= 1 {
+            data
+        } else {
+            let mut interleaved = Vec::with_capacity(data.len());
+            for i in 0..samples {
+                for ch in 0..channels {
+                    let idx = ch * samples + i;
+                    if let Some(v) = data.get(idx) {
+                        interleaved.push(*v);
+                    }
+                }
+            }
+            interleaved
+        };
+
+        audio::write_wav_f32(path, &out, self.sample_rate, channels_u16)?;
         Ok(())
     }
 }
@@ -613,27 +633,28 @@ impl ChatterboxTTS {
         wav_path: &Path,
         exaggeration: Option<f32>,
     ) -> Result<()> {
-        let wav_str = wav_path.to_string_lossy();
         let exag = exaggeration.unwrap_or(0.5);
-
-        let librosa = py.import("librosa")?;
-        let torch = py.import("torch")?;
 
         let device_str = self.device.as_str();
         let t3_obj = self.inner.getattr(py, "t3")?;
         let t3 = t3_obj.bind(py);
-        // Load reference wav at 24kHz
-        let load_kwargs = PyDict::new(py);
-        load_kwargs.set_item("sr", S3GEN_SR)?;
-        let wav_tuple = librosa.call_method("load", (wav_str.as_ref(),), Some(&load_kwargs))?;
-        let s3gen_ref_wav_np = wav_tuple.get_item(0)?;
-        let s3gen_ref_wav = torch.call_method1("from_numpy", (s3gen_ref_wav_np.clone(),))?;
+
+        // Load reference wav (Rust) and resample to 24kHz
+        let (wav_samples, wav_sr) = audio::load_wav_mono(wav_path)?;
+        let s3gen_ref_samples = if wav_sr != S3GEN_SR {
+            audio::resample_linear(&wav_samples, wav_sr, S3GEN_SR)
+        } else {
+            wav_samples
+        };
+        let mut s3gen_ref_tch = TchTensor::from_slice(&s3gen_ref_samples)
+            .to_device(self.device.to_tch_device())
+            .to_kind(TchKind::Float);
 
         // Truncate decoder conditioning audio
-        let dec_slice = PySlice::new(py, 0, Self::DEC_COND_LEN as isize, 1);
-        let s3gen_ref_wav = s3gen_ref_wav.get_item(dec_slice)?;
-
-        let s3gen_ref_tch = py_tensor_to_tch(py, &s3gen_ref_wav)?;
+        let dec_len = Self::DEC_COND_LEN as i64;
+        if s3gen_ref_tch.size()[0] > dec_len {
+            s3gen_ref_tch = s3gen_ref_tch.narrow(0, 0, dec_len);
+        }
         let s3gen_ref = self.s3gen_rs.embed_ref(&s3gen_ref_tch, S3GEN_SR as i64)?;
         let s3gen_ref_dict = s3gen_ref_to_py(py, &s3gen_ref)?;
 

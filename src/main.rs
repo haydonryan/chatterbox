@@ -1,4 +1,5 @@
 mod chatterbox;
+mod audio;
 mod error;
 mod models;
 
