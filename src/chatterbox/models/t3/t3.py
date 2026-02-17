@@ -24,7 +24,8 @@ from .modules.cond_enc import T3CondEnc, T3Cond
 from .modules.t3_config import T3Config
 from .llama_configs import LLAMA_CONFIGS
 from .inference.t3_hf_backend import T3HuggingfaceBackend
-from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
+# NOTE: AlignmentStreamAnalyzer is now implemented in Rust at src/models/t3/inference/alignment_stream_analyzer.rs
+# from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
 from ..utils import AttrDict
 
 
@@ -275,24 +276,25 @@ class T3(nn.Module):
         # TODO? synchronize the expensive compile function
         # with self.compile_lock:
         if not self.compiled:
-            # Default to None for English models, only create for multilingual
-            alignment_stream_analyzer = None
-            if self.hp.is_multilingual:
-                alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                    self.tfmr,
-                    None,
-                    text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-                    alignment_layer_idx=9, # TODO: hparam or something?
-                    eos_idx=self.hp.stop_speech_token,
-                )
-                assert alignment_stream_analyzer.eos_idx == self.hp.stop_speech_token
+            # NOTE: AlignmentStreamAnalyzer is now handled by Rust in T3::inference
+            # The Rust code creates its own AlignmentStreamAnalyzer and calls update_attentions/step directly
+            # alignment_stream_analyzer = None
+            # if self.hp.is_multilingual:
+            #     alignment_stream_analyzer = AlignmentStreamAnalyzer(
+            #         self.tfmr,
+            #         None,
+            #         text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+            #         alignment_layer_idx=9, # TODO: hparam or something?
+            #         eos_idx=self.hp.stop_speech_token,
+            #     )
+            #     assert alignment_stream_analyzer.eos_idx == self.hp.stop_speech_token
 
             patched_model = T3HuggingfaceBackend(
                 config=self.cfg,
                 llama=self.tfmr,
                 speech_enc=self.speech_emb,
                 speech_head=self.speech_head,
-                alignment_stream_analyzer=alignment_stream_analyzer,
+                # alignment_stream_analyzer is now handled by Rust
             )
             self.patched_model = patched_model
             self.compiled = True

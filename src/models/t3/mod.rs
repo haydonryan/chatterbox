@@ -485,24 +485,8 @@ impl T3 {
         // Build / reuse patched model
         let compiled: bool = self.inner.getattr(py, "compiled")?.extract(py)?;
         if !compiled {
-            let is_multilingual: bool = hp.getattr(py, "is_multilingual")?.extract(py)?;
-            let alignment_stream_analyzer: Option<Bound<'_, PyAny>> = if is_multilingual {
-                let analyzer_mod = py.import("chatterbox.models.t3.inference.alignment_stream_analyzer")?;
-                let analyzer_class = analyzer_mod.getattr("AlignmentStreamAnalyzer")?;
-                let text_len = Self::tensor_size(py, &text_tokens, -1)?;
-                let slice = (len_cond, len_cond + text_len);
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("text_tokens_slice", slice)?;
-                kwargs.set_item("alignment_layer_idx", 9)?;
-                kwargs.set_item("eos_idx", stop_speech)?;
-                Some(analyzer_class.call(
-                    (self.inner.getattr(py, "tfmr")?, py.None()),
-                    Some(&kwargs),
-                )?)
-            } else {
-                None
-            };
-
+            // Create T3HuggingfaceBackend without alignment_stream_analyzer
+            // (we'll use the Rust AlignmentStreamAnalyzer directly)
             let backend_mod = py.import("chatterbox.models.t3.inference.t3_hf_backend")?;
             let backend_class = backend_mod.getattr("T3HuggingfaceBackend")?;
             let kwargs = PyDict::new(py);
@@ -510,15 +494,29 @@ impl T3 {
             kwargs.set_item("llama", self.inner.getattr(py, "tfmr")?)?;
             kwargs.set_item("speech_enc", self.inner.getattr(py, "speech_emb")?)?;
             kwargs.set_item("speech_head", self.inner.getattr(py, "speech_head")?)?;
-            if let Some(alignment) = alignment_stream_analyzer {
-                kwargs.set_item("alignment_stream_analyzer", alignment)?;
-            }
             let patched_model = backend_class.call((), Some(&kwargs))?;
             self.inner.setattr(py, "patched_model", patched_model)?;
             self.inner.setattr(py, "compiled", true)?;
         }
 
         let patched_model = self.inner.getattr(py, "patched_model")?;
+
+        // Create Rust AlignmentStreamAnalyzer for multilingual models
+        let is_multilingual: bool = hp.getattr(py, "is_multilingual")?.extract(py)?;
+        let mut alignment_analyzer: Option<AlignmentStreamAnalyzer> = if is_multilingual {
+            let text_len = Self::tensor_size(py, &text_tokens, -1)?;
+            let slice = (len_cond, len_cond + text_len);
+            let tfmr = self.inner.getattr(py, "tfmr")?;
+            Some(AlignmentStreamAnalyzer::new(
+                py,
+                tfmr.bind(py),
+                slice,
+                Some(9),
+                stop_speech,
+            )?)
+        } else {
+            None
+        };
 
         let bos_kwargs = PyDict::new(py);
         bos_kwargs.set_item("dtype", torch.getattr("long")?)?;
@@ -564,6 +562,12 @@ impl T3 {
         let mut output = output.unbind();
         let mut past = output.bind(py).getattr("past_key_values")?.unbind();
 
+        // Update alignment analyzer with attention outputs from initial forward pass
+        if let Some(ref mut analyzer) = alignment_analyzer {
+            let attentions = output.bind(py).getattr("attentions")?;
+            analyzer.update_attentions(py, &attentions)?;
+        }
+
         let max_new_tokens = options.max_new_tokens.map(|v| v as i64).unwrap_or(max_speech_tokens);
 
         for i in 0..max_new_tokens {
@@ -583,25 +587,21 @@ impl T3 {
             let scaled = diff.call_method1("__mul__", (cfg,))?;
             let mut logits = cond.call_method1("__add__", (scaled,))?;
 
-            let alignment_stream_analyzer = patched_model.getattr(py, "alignment_stream_analyzer")?;
-            if !alignment_stream_analyzer.is_none(py) {
-                let alignment_stream_analyzer = alignment_stream_analyzer.bind(py);
+            // Use Rust AlignmentStreamAnalyzer if available
+            if let Some(ref mut analyzer) = alignment_analyzer {
                 let len = Self::tensor_size(py, generated_ids.bind(py), 1)?;
-                let last_token = if len > 0 {
+                let last_token: Option<i64> = if len > 0 {
                     let item = generated_ids
                         .bind(py)
                         .call_method1("select", (0, 0))?
                         .call_method1("select", (0, len - 1))?
-                        .call_method0("item")?;
+                        .call_method0("item")?
+                        .extract()?;
                     Some(item)
                 } else {
                     None
                 };
-                let kwargs = PyDict::new(py);
-                if let Some(tok) = last_token {
-                    kwargs.set_item("next_token", tok)?;
-                }
-                logits = alignment_stream_analyzer.call_method("step", (logits,), Some(&kwargs))?;
+                logits = analyzer.step(py, &logits, last_token)?.bind(py).clone();
             }
 
             let ids_for_proc = generated_ids.bind(py).call_method1("narrow", (0, 0, 1))?;
@@ -649,6 +649,13 @@ impl T3 {
                 kwargs
             }))?;
             output = output_next.unbind();
+
+            // Update alignment analyzer with attention outputs from this forward pass
+            if let Some(ref mut analyzer) = alignment_analyzer {
+                let attentions = output.bind(py).getattr("attentions")?;
+                analyzer.update_attentions(py, &attentions)?;
+            }
+
             past = output.bind(py).getattr("past_key_values")?.unbind();
         }
 
