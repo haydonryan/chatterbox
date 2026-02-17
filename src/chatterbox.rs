@@ -8,6 +8,7 @@ use crate::error::{ChatterboxError, Result};
 use crate::models::s3gen::SPEECH_VOCAB_SIZE;
 use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3Cond, T3CondRust, T3Rust, VoiceEncoder};
 use tch::{Device as TchDevice, IndexOp, Kind as TchKind, Tensor as TchTensor};
+use std::sync::RwLock;
 
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
@@ -430,6 +431,8 @@ pub struct ChatterboxTTS {
     voice_encoder: VoiceEncoder,
     /// Rust-native T3 inference
     t3_rs: T3Rust,
+    /// Rust-native T3 conditionals (set by prepare_conditionals)
+    t3_cond_rs: RwLock<Option<T3CondRust>>,
 }
 
 impl ChatterboxTTS {
@@ -552,13 +555,15 @@ impl ChatterboxTTS {
 
         // Load conditionals if conds.pt exists
         let conds_path = ckpt_dir.join("conds.pt");
-        let conds = if conds_path.exists() {
+        let (conds, t3_cond_rs) = if conds_path.exists() {
             println!("[DEBUG] Loading Conditionals from conds.pt...");
             let loaded_conds = Conditionals::load(py, &conds_path, Some(device))?;
             let loaded_conds = loaded_conds.to_device(py, device)?;
-            loaded_conds.to_py(py)?
+            let t3_cond_rs = t3_cond_from_py(py, &loaded_conds.t3().as_py().bind(py))?;
+            let conds = loaded_conds.to_py(py)?;
+            (conds, Some(t3_cond_rs))
         } else {
-            py.None()
+            (py.None(), None)
         };
 
         println!("[DEBUG] Creating ChatterboxTTS instance...");
@@ -581,6 +586,7 @@ impl ChatterboxTTS {
             s3gen_rs,
             voice_encoder,
             t3_rs,
+            t3_cond_rs: RwLock::new(t3_cond_rs),
         })
     }
 
@@ -601,6 +607,10 @@ impl ChatterboxTTS {
         if conds.is_none(py) {
             Ok(None)
         } else {
+            let t3 = conds.getattr(py, "t3")?;
+            if t3.is_none(py) {
+                return Ok(None);
+            }
             Ok(Some(Conditionals::from_py(&conds.bind(py))?))
         }
     }
@@ -609,6 +619,10 @@ impl ChatterboxTTS {
     pub fn set_conditionals(&self, py: Python<'_>, conds: &Conditionals) -> Result<()> {
         let conds_obj = conds.to_py(py)?;
         self.inner.setattr(py, "conds", conds_obj)?;
+        let t3_cond_rs = t3_cond_from_py(py, &conds.t3().as_py().bind(py))?;
+        if let Ok(mut guard) = self.t3_cond_rs.write() {
+            *guard = Some(t3_cond_rs);
+        }
         Ok(())
     }
 
@@ -652,7 +666,7 @@ impl ChatterboxTTS {
         // Speech cond prompt tokens (optional)
         let plen: u32 = self.t3_rs.config().speech_cond_prompt_len;
 
-        let t3_cond_prompt_tokens: Option<Py<PyAny>> = if plen > 0 {
+        let t3_cond_prompt_tokens: Option<TchTensor> = if plen > 0 {
             let ref_16k = self.s3gen_rs.resample_to_16k(&s3gen_ref_tch)?;
             let ref_16k = if ref_16k.dim() == 1 {
                 ref_16k.unsqueeze(0)
@@ -666,9 +680,7 @@ impl ChatterboxTTS {
                 ref_16k
             };
             let (tokens, _lens) = self.s3gen_rs.tokenizer().forward(&ref_16k, Some(plen as i64))?;
-            let tokens_py = tch_tensor_to_py_with_dtype(py, &tokens, "int64")?;
-            let tokens_py = tokens_py.bind(py).call_method1("to", (device_str,))?;
-            Some(tokens_py.unbind())
+            Some(tokens.to_device(self.device.to_tch_device()))
         } else {
             None
         };
@@ -683,18 +695,27 @@ impl ChatterboxTTS {
             Some(32),
         )?;
         let ve_embed = ve_embeds.mean_dim(&[0_i64][..], true, TchKind::Float);
-        let ve_embed = tch_tensor_to_py_with_dtype(py, &ve_embed, "float32")?;
-        let ve_embed = ve_embed.bind(py).call_method1("to", (device_str,))?;
-
-        let t3_tokens_bound = t3_cond_prompt_tokens.as_ref().map(|t| t.bind(py));
-        let t3_cond = match t3_tokens_bound {
-            Some(ref tokens) => T3Cond::new(py, &ve_embed, Some(tokens), Some(exag))?,
-            None => T3Cond::new(py, &ve_embed, None, Some(exag))?,
+        let emotion_adv = TchTensor::full(
+            [1, 1, 1],
+            f64::from(exag),
+            (TchKind::Float, self.device.to_tch_device()),
+        );
+        let t3_cond_rs = T3CondRust {
+            speaker_emb: ve_embed,
+            cond_prompt_speech_tokens: t3_cond_prompt_tokens,
+            cond_prompt_speech_emb: None,
+            emotion_adv: Some(emotion_adv),
         };
-        let t3_cond = t3_cond.to_device(py, device_str)?;
+        if let Ok(mut guard) = self.t3_cond_rs.write() {
+            *guard = Some(t3_cond_rs);
+        }
 
-        let conds = Conditionals::new(t3_cond, s3gen_ref_dict);
-        let conds_obj = conds.to_py(py)?;
+        let types = py.import("types")?;
+        let ns_class = types.getattr("SimpleNamespace")?;
+        let ns_kwargs = PyDict::new(py);
+        ns_kwargs.set_item("t3", py.None())?;
+        ns_kwargs.set_item("gen", s3gen_ref_dict)?;
+        let conds_obj = ns_class.call((), Some(&ns_kwargs))?;
         self.inner.setattr(py, "conds", conds_obj)?;
         Ok(())
     }
@@ -721,31 +742,6 @@ impl ChatterboxTTS {
         }
 
         let conds = self.inner.getattr(py, "conds")?;
-        let t3_cond = conds.getattr(py, "t3")?;
-
-        // Update exaggeration if needed
-        let emotion_adv = t3_cond.getattr(py, "emotion_adv")?;
-        let current_exag: f32 = emotion_adv
-            .bind(py)
-            .get_item((0, 0, 0))?
-            .extract()?;
-        if options.exaggeration != current_exag {
-            let speaker_emb = t3_cond.getattr(py, "speaker_emb")?;
-            let cond_prompt_speech_tokens = t3_cond.getattr(py, "cond_prompt_speech_tokens")?;
-            let cond_tokens = if cond_prompt_speech_tokens.is_none(py) {
-                None
-            } else {
-                Some(cond_prompt_speech_tokens.bind(py))
-            };
-
-            let speaker_emb = speaker_emb.bind(py);
-            let new_t3_cond = match cond_tokens {
-                Some(ref tokens) => T3Cond::new(py, &speaker_emb, Some(tokens), Some(options.exaggeration))?,
-                None => T3Cond::new(py, &speaker_emb, None, Some(options.exaggeration))?,
-            };
-            let new_t3_cond = new_t3_cond.to_device(py, device_str)?;
-            conds.setattr(py, "t3", new_t3_cond.as_py())?;
-        }
 
         // Norm and tokenize text
         let text = punc_norm(text);
@@ -772,9 +768,21 @@ impl ChatterboxTTS {
         pad_kwargs.set_item("value", eot)?;
         text_tokens = torch_fn.call_method(py, "pad", (text_tokens, (0, 1)), Some(&pad_kwargs))?;
 
-        let t3_cond = conds.getattr(py, "t3")?;
-        let t3_cond = t3_cond.bind(py);
-        let t3_cond_rs = t3_cond_from_py(py, &t3_cond)?;
+        let mut t3_cond_rs = {
+            let guard = self
+                .t3_cond_rs
+                .read()
+                .map_err(|_| ChatterboxError::ConditionalsNotPrepared)?;
+            match guard.as_ref() {
+                Some(cond) => cond.clone(),
+                None => return Err(ChatterboxError::ConditionalsNotPrepared),
+            }
+        };
+        t3_cond_rs.emotion_adv = Some(TchTensor::full(
+            [1, 1, 1],
+            f64::from(options.exaggeration),
+            (TchKind::Float, self.device.to_tch_device()),
+        ));
 
         let text_tokens_tch = py_tensor_to_tch(py, &text_tokens.bind(py))?;
         let t3_opts = crate::models::t3::T3InferenceOptions::new()

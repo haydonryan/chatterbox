@@ -28,6 +28,12 @@ impl T3CondRust {
     }
 }
 
+impl Clone for T3CondRust {
+    fn clone(&self) -> Self {
+        self.shallow_clone()
+    }
+}
+
 pub struct T3Rust {
     config: T3Config,
     device: Device,
