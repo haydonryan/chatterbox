@@ -433,6 +433,8 @@ pub struct ChatterboxTTS {
     t3_rs: T3Rust,
     /// Rust-native T3 conditionals (set by prepare_conditionals)
     t3_cond_rs: RwLock<Option<T3CondRust>>,
+    /// Rust-native S3Gen reference dict (set by prepare_conditionals)
+    s3gen_ref_rs: RwLock<Option<S3GenRef>>,
 }
 
 impl ChatterboxTTS {
@@ -553,17 +555,14 @@ impl ChatterboxTTS {
         let tokenizer_path = ckpt_dir.join("tokenizer.json");
         let tokenizer = EnTokenizer::new(py, &tokenizer_path)?;
 
-        // Load conditionals if conds.pt exists
+        // Load conditionals if conds.pt exists (store in Rust only)
         let conds_path = ckpt_dir.join("conds.pt");
-        let (conds, t3_cond_rs) = if conds_path.exists() {
+        let (t3_cond_rs, s3gen_ref_rs) = if conds_path.exists() {
             println!("[DEBUG] Loading Conditionals from conds.pt...");
-            let loaded_conds = Conditionals::load(py, &conds_path, Some(device))?;
-            let loaded_conds = loaded_conds.to_device(py, device)?;
-            let t3_cond_rs = t3_cond_from_py(py, &loaded_conds.t3().as_py().bind(py))?;
-            let conds = loaded_conds.to_py(py)?;
-            (conds, Some(t3_cond_rs))
+            let (t3_cond_rs, s3gen_ref_rs) = load_conds_pt(py, &conds_path, Some(device))?;
+            (Some(t3_cond_rs), Some(s3gen_ref_rs))
         } else {
-            (py.None(), None)
+            (None, None)
         };
 
         println!("[DEBUG] Creating ChatterboxTTS instance...");
@@ -576,7 +575,7 @@ impl ChatterboxTTS {
         ns_kwargs.set_item("ve", py.None())?;
         ns_kwargs.set_item("tokenizer", tokenizer.as_py())?;
         ns_kwargs.set_item("device", device_str)?;
-        ns_kwargs.set_item("conds", conds)?;
+        ns_kwargs.set_item("conds", py.None())?;
         let instance = ns_class.call((), Some(&ns_kwargs))?;
 
         Ok(Self {
@@ -587,6 +586,7 @@ impl ChatterboxTTS {
             voice_encoder,
             t3_rs,
             t3_cond_rs: RwLock::new(t3_cond_rs),
+            s3gen_ref_rs: RwLock::new(s3gen_ref_rs),
         })
     }
 
@@ -601,28 +601,25 @@ impl ChatterboxTTS {
         Ok(sr.extract(py)?)
     }
 
-    /// Get current conditionals if set
-    pub fn conditionals(&self, py: Python<'_>) -> Result<Option<Conditionals>> {
-        let conds = self.inner.getattr(py, "conds")?;
-        if conds.is_none(py) {
-            Ok(None)
-        } else {
-            let t3 = conds.getattr(py, "t3")?;
-            if t3.is_none(py) {
-                return Ok(None);
-            }
-            Ok(Some(Conditionals::from_py(&conds.bind(py))?))
-        }
+    /// Get current conditionals if set.
+    ///
+    /// Note: conditionals are stored in Rust only; no Python conditionals are tracked.
+    pub fn conditionals(&self, _py: Python<'_>) -> Result<Option<Conditionals>> {
+        Ok(None)
     }
 
     /// Set conditionals directly
     pub fn set_conditionals(&self, py: Python<'_>, conds: &Conditionals) -> Result<()> {
-        let conds_obj = conds.to_py(py)?;
-        self.inner.setattr(py, "conds", conds_obj)?;
         let t3_cond_rs = t3_cond_from_py(py, &conds.t3().as_py().bind(py))?;
+        let gen_dict = conds.gen_dict().bind(py);
+        let s3gen_ref_rs = py_ref_to_s3gen(py, &gen_dict)?;
         if let Ok(mut guard) = self.t3_cond_rs.write() {
             *guard = Some(t3_cond_rs);
         }
+        if let Ok(mut guard) = self.s3gen_ref_rs.write() {
+            *guard = Some(s3gen_ref_rs);
+        }
+        self.inner.setattr(py, "conds", py.None())?;
         Ok(())
     }
 
@@ -636,13 +633,11 @@ impl ChatterboxTTS {
     /// * `exaggeration` - Emotion exaggeration factor (0.0-1.0, default 0.5)
     pub fn prepare_conditionals(
         &self,
-        py: Python<'_>,
+        _py: Python<'_>,
         wav_path: &Path,
         exaggeration: Option<f32>,
     ) -> Result<()> {
         let exag = exaggeration.unwrap_or(0.5);
-
-        let device_str = self.device.as_str();
 
         // Load reference wav (Rust) and resample to 24kHz
         let (wav_samples, wav_sr) = audio::load_wav_mono(wav_path)?;
@@ -661,7 +656,9 @@ impl ChatterboxTTS {
             s3gen_ref_tch = s3gen_ref_tch.narrow(0, 0, dec_len);
         }
         let s3gen_ref = self.s3gen_rs.embed_ref(&s3gen_ref_tch, S3GEN_SR as i64)?;
-        let s3gen_ref_dict = s3gen_ref_to_py(py, &s3gen_ref)?;
+        if let Ok(mut guard) = self.s3gen_ref_rs.write() {
+            *guard = Some(s3gen_ref);
+        }
 
         // Speech cond prompt tokens (optional)
         let plen: u32 = self.t3_rs.config().speech_cond_prompt_len;
@@ -710,13 +707,7 @@ impl ChatterboxTTS {
             *guard = Some(t3_cond_rs);
         }
 
-        let types = py.import("types")?;
-        let ns_class = types.getattr("SimpleNamespace")?;
-        let ns_kwargs = PyDict::new(py);
-        ns_kwargs.set_item("t3", py.None())?;
-        ns_kwargs.set_item("gen", s3gen_ref_dict)?;
-        let conds_obj = ns_class.call((), Some(&ns_kwargs))?;
-        self.inner.setattr(py, "conds", conds_obj)?;
+        self.inner.setattr(_py, "conds", _py.None())?;
         Ok(())
     }
 
@@ -735,13 +726,20 @@ impl ChatterboxTTS {
         if let Some(ref path) = options.audio_prompt_path {
             self.prepare_conditionals(py, Path::new(path), Some(options.exaggeration))?;
         } else {
-            let conds = self.inner.getattr(py, "conds")?;
-            if conds.is_none(py) {
+            let have_t3 = self
+                .t3_cond_rs
+                .read()
+                .map_err(|_| ChatterboxError::ConditionalsNotPrepared)?
+                .is_some();
+            let have_ref = self
+                .s3gen_ref_rs
+                .read()
+                .map_err(|_| ChatterboxError::ConditionalsNotPrepared)?
+                .is_some();
+            if !have_t3 || !have_ref {
                 return Err(ChatterboxError::ConditionalsNotPrepared);
             }
         }
-
-        let conds = self.inner.getattr(py, "conds")?;
 
         // Norm and tokenize text
         let text = punc_norm(text);
@@ -794,9 +792,13 @@ impl ChatterboxTTS {
             .max_new_tokens(1000);
         let tokens_tch = self.t3_rs.inference(&text_tokens_tch, &t3_cond_rs, &t3_opts)?;
 
-        let gen_any = conds.getattr(py, "gen")?;
-        let gen_dict = gen_any.bind(py);
-        let ref_dict = self.py_ref_to_s3gen(py, &gen_dict)?;
+        let ref_guard = self
+            .s3gen_ref_rs
+            .read()
+            .map_err(|_| ChatterboxError::ConditionalsNotPrepared)?;
+        let ref_dict = ref_guard
+            .as_ref()
+            .ok_or(ChatterboxError::ConditionalsNotPrepared)?;
         let tokens_tch = drop_invalid_s3_tokens(&tokens_tch)?;
         let wav_tch = self
             .s3gen_rs
@@ -806,26 +808,6 @@ impl ChatterboxTTS {
 
         let sr = self.sample_rate(py)?;
         Ok(AudioOutput::from_tensor(wav, sr))
-    }
-
-    fn py_ref_to_s3gen(&self, py: Python<'_>, gen_dict: &Bound<'_, PyAny>) -> Result<S3GenRef> {
-        let prompt_token = gen_dict.get_item("prompt_token")?;
-        let prompt_token_len = gen_dict.get_item("prompt_token_len")?;
-        let prompt_feat = gen_dict.get_item("prompt_feat")?;
-        let embedding = gen_dict.get_item("embedding")?;
-
-        let prompt_token = py_tensor_to_tch(py, &prompt_token)?;
-        let prompt_token_len = py_tensor_to_tch(py, &prompt_token_len)?;
-        let prompt_feat = py_tensor_to_tch(py, &prompt_feat)?;
-        let embedding = py_tensor_to_tch(py, &embedding)?;
-
-        Ok(S3GenRef::new(
-            prompt_token,
-            prompt_token_len,
-            prompt_feat,
-            None,
-            embedding,
-        ))
     }
 
     /// Simple generation with default options
@@ -848,7 +830,7 @@ impl ChatterboxTTS {
     }
 }
 
-fn py_tensor_to_tch(py: Python<'_>, tensor: &Bound<'_, PyAny>) -> Result<TchTensor> {
+fn py_tensor_to_tch(_py: Python<'_>, tensor: &Bound<'_, PyAny>) -> Result<TchTensor> {
     let tensor = tensor.call_method0("detach")?.call_method0("cpu")?;
     let numpy = tensor.call_method0("numpy")?;
     let dtype: String = numpy.getattr("dtype")?.getattr("name")?.extract()?;
@@ -881,31 +863,24 @@ fn tch_tensor_to_py(py: Python<'_>, tensor: &TchTensor) -> Result<Py<PyAny>> {
     Ok(out.into())
 }
 
-fn tch_tensor_to_py_with_dtype(
-    py: Python<'_>,
-    tensor: &TchTensor,
-    dtype_name: &str,
-) -> Result<Py<PyAny>> {
-    let torch = py.import("torch")?;
-    let out = tch_tensor_to_py(py, tensor)?;
-    let dtype = torch.getattr(dtype_name)?;
-    let cast = out.bind(py).call_method1("to", (dtype,))?;
-    Ok(cast.unbind())
-}
+fn py_ref_to_s3gen(py: Python<'_>, gen_dict: &Bound<'_, PyAny>) -> Result<S3GenRef> {
+    let prompt_token = gen_dict.get_item("prompt_token")?;
+    let prompt_token_len = gen_dict.get_item("prompt_token_len")?;
+    let prompt_feat = gen_dict.get_item("prompt_feat")?;
+    let embedding = gen_dict.get_item("embedding")?;
 
-fn s3gen_ref_to_py(py: Python<'_>, ref_dict: &S3GenRef) -> Result<Py<PyAny>> {
-    let dict = PyDict::new(py);
-    let prompt_token = tch_tensor_to_py_with_dtype(py, &ref_dict.prompt_token, "int64")?;
-    let prompt_token_len = tch_tensor_to_py_with_dtype(py, &ref_dict.prompt_token_len, "int64")?;
-    let prompt_feat = tch_tensor_to_py(py, &ref_dict.prompt_feat)?;
-    let embedding = tch_tensor_to_py(py, &ref_dict.embedding)?;
+    let prompt_token = py_tensor_to_tch(py, &prompt_token)?;
+    let prompt_token_len = py_tensor_to_tch(py, &prompt_token_len)?;
+    let prompt_feat = py_tensor_to_tch(py, &prompt_feat)?;
+    let embedding = py_tensor_to_tch(py, &embedding)?;
 
-    dict.set_item("prompt_token", prompt_token)?;
-    dict.set_item("prompt_token_len", prompt_token_len)?;
-    dict.set_item("prompt_feat", prompt_feat)?;
-    dict.set_item("prompt_feat_len", py.None())?;
-    dict.set_item("embedding", embedding)?;
-    Ok(dict.into())
+    Ok(S3GenRef::new(
+        prompt_token,
+        prompt_token_len,
+        prompt_feat,
+        None,
+        embedding,
+    ))
 }
 
 fn t3_cond_from_py(py: Python<'_>, t3_cond: &Bound<'_, PyAny>) -> Result<T3CondRust> {
@@ -939,6 +914,83 @@ fn t3_cond_from_py(py: Python<'_>, t3_cond: &Bound<'_, PyAny>) -> Result<T3CondR
         cond_prompt_speech_emb,
         emotion_adv,
     })
+}
+
+fn load_conds_pt(
+    py: Python<'_>,
+    path: &Path,
+    device: Option<Device>,
+) -> Result<(T3CondRust, S3GenRef)> {
+    let torch = py.import("torch")?;
+    let path_str = path.to_string_lossy();
+    let map_location = device.map(|d| d.as_str()).unwrap_or("cpu");
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("map_location", map_location)?;
+    kwargs.set_item("weights_only", true)?;
+
+    let loaded = torch.call_method("load", (path_str.as_ref(),), Some(&kwargs))?;
+    let loaded = loaded
+        .cast::<PyDict>()
+        .map_err(|e| ChatterboxError::Python(pyo3::exceptions::PyTypeError::new_err(e.to_string())))?;
+    let t3_item = loaded
+        .get_item("t3")?
+        .ok_or_else(|| ChatterboxError::Python(pyo3::exceptions::PyKeyError::new_err("t3")))?;
+    let gen_item = loaded
+        .get_item("gen")?
+        .ok_or_else(|| ChatterboxError::Python(pyo3::exceptions::PyKeyError::new_err("gen")))?;
+
+    let t3_dict = t3_item
+        .cast::<PyDict>()
+        .map_err(|e| ChatterboxError::Python(pyo3::exceptions::PyTypeError::new_err(e.to_string())))?;
+
+    let speaker_emb = t3_dict
+        .get_item("speaker_emb")?
+        .ok_or_else(|| ChatterboxError::Python(pyo3::exceptions::PyKeyError::new_err("speaker_emb")))?;
+    let speaker_emb = py_tensor_to_tch(py, &speaker_emb)?;
+
+    let cond_prompt_speech_tokens = t3_dict.get_item("cond_prompt_speech_tokens")?;
+    let cond_prompt_speech_tokens = if let Some(tokens) = cond_prompt_speech_tokens {
+        if tokens.is_none() {
+            None
+        } else {
+            Some(py_tensor_to_tch(py, &tokens)?)
+        }
+    } else {
+        None
+    };
+
+    let cond_prompt_speech_emb = t3_dict.get_item("cond_prompt_speech_emb")?;
+    let cond_prompt_speech_emb = if let Some(emb) = cond_prompt_speech_emb {
+        if emb.is_none() {
+            None
+        } else {
+            Some(py_tensor_to_tch(py, &emb)?)
+        }
+    } else {
+        None
+    };
+
+    let emotion_adv = t3_dict.get_item("emotion_adv")?;
+    let emotion_adv = if let Some(emotion) = emotion_adv {
+        if emotion.is_none() {
+            None
+        } else {
+            Some(py_tensor_to_tch(py, &emotion)?)
+        }
+    } else {
+        None
+    };
+
+    let t3_cond_rs = T3CondRust {
+        speaker_emb,
+        cond_prompt_speech_tokens,
+        cond_prompt_speech_emb,
+        emotion_adv,
+    };
+
+    let s3gen_ref_rs = py_ref_to_s3gen(py, &gen_item)?;
+
+    Ok((t3_cond_rs, s3gen_ref_rs))
 }
 
 fn drop_invalid_s3_tokens(tokens: &TchTensor) -> Result<TchTensor> {
