@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::audio;
 use crate::error::{ChatterboxError, Result};
 use crate::models::s3gen::SPEECH_VOCAB_SIZE;
-use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3, T3Cond, T3CondRust, T3Rust, VoiceEncoder};
+use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3Cond, T3CondRust, T3Rust, VoiceEncoder};
 use tch::{Device as TchDevice, IndexOp, Kind as TchKind, Tensor as TchTensor};
 
 // Sample rate constants from Python
@@ -529,21 +529,9 @@ impl ChatterboxTTS {
         let ve_path = ckpt_dir.join("ve.safetensors");
         let voice_encoder = VoiceEncoder::from_safetensors(&ve_path, device.to_tch_device())?;
 
-        // Load T3 using Rust wrapper
-        println!("[DEBUG] Loading T3...");
-        let t3 = T3::new(py)?;
+        // Load T3 using Rust implementation only (no Python runtime)
+        println!("[DEBUG] Loading T3 (Rust)...");
         let t3_path = ckpt_dir.join("t3_cfg.safetensors");
-        let t3_state = load_file.call1((t3_path.to_string_lossy().as_ref(),))?;
-        // Check if "model" key exists and extract it
-        let t3_state = if t3_state.call_method0("keys")?.call_method1("__contains__", ("model",))?.extract::<bool>()? {
-            t3_state.get_item("model")?.get_item(0)?
-        } else {
-            t3_state
-        };
-        t3.load_state_dict(py, &t3_state)?;
-        t3.to_device(py, device_str)?;
-        t3.eval(py)?;
-
         let t3_rs = T3Rust::from_safetensors(&t3_path, device.to_tch_device())?;
 
         println!("[DEBUG] Loading S3Gen...");
@@ -578,7 +566,7 @@ impl ChatterboxTTS {
         let ns_class = types.getattr("SimpleNamespace")?;
         let ns_kwargs = PyDict::new(py);
         ns_kwargs.set_item("sr", S3GEN_SR)?;
-        ns_kwargs.set_item("t3", t3.as_py())?;
+        ns_kwargs.set_item("t3", py.None())?;
         ns_kwargs.set_item("s3gen", s3gen)?;
         ns_kwargs.set_item("ve", py.None())?;
         ns_kwargs.set_item("tokenizer", tokenizer.as_py())?;
