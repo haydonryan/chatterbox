@@ -135,6 +135,48 @@ pub fn write_wav_f32(path: &Path, samples: &[f32], sample_rate: u32, channels: u
     Ok(())
 }
 
+pub fn write_wav_pcm16(path: &Path, samples: &[f32], sample_rate: u32, channels: u16) -> Result<()> {
+    if channels == 0 {
+        return Err(ChatterboxError::ShapeMismatch(
+            "cannot write WAV with zero channels".to_string(),
+        ));
+    }
+    let bytes_per_sample = 2u16;
+    let block_align = channels * bytes_per_sample;
+    let byte_rate = sample_rate as u32 * block_align as u32;
+    let data_bytes = (samples.len() * 2) as u32;
+    let riff_size = 4 + (8 + 16) + (8 + data_bytes);
+
+    let mut buf = Vec::with_capacity((riff_size + 8) as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&riff_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&(bytes_per_sample * 8).to_le_bytes());
+
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        let clamped = sample.max(-1.0).min(1.0);
+        let scaled = if clamped >= 0.0 {
+            (clamped * 32767.0).round() as i16
+        } else {
+            (clamped * 32768.0).round() as i16
+        };
+        buf.extend_from_slice(&scaled.to_le_bytes());
+    }
+
+    std::fs::write(path, buf)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WavFmt {
     audio_format: u16,

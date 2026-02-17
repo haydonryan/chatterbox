@@ -387,8 +387,35 @@ impl AudioOutput {
         Ok(data)
     }
 
-    /// Save audio to WAV file (Rust implementation).
+    /// Save audio to WAV file as 16-bit PCM (pcm_s16le).
     pub fn save_wav(&self, py: Python<'_>, path: &Path) -> Result<()> {
+        let (channels, samples) = self.shape(py)?;
+        let data = self.to_vec(py)?;
+        let channels_u16 = u16::try_from(channels).map_err(|_| {
+            ChatterboxError::ShapeMismatch("too many channels for WAV".to_string())
+        })?;
+
+        let out = if channels <= 1 {
+            data
+        } else {
+            let mut interleaved = Vec::with_capacity(data.len());
+            for i in 0..samples {
+                for ch in 0..channels {
+                    let idx = ch * samples + i;
+                    if let Some(v) = data.get(idx) {
+                        interleaved.push(*v);
+                    }
+                }
+            }
+            interleaved
+        };
+
+        audio::write_wav_pcm16(path, &out, self.sample_rate, channels_u16)?;
+        Ok(())
+    }
+
+    /// Save audio to 32-bit float WAV file.
+    pub fn save_wav_f32(&self, py: Python<'_>, path: &Path) -> Result<()> {
         let (channels, samples) = self.shape(py)?;
         let data = self.to_vec(py)?;
         let channels_u16 = u16::try_from(channels).map_err(|_| {
