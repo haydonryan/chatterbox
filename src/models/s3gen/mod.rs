@@ -10,11 +10,12 @@ pub mod tokenizer;
 pub mod speaker_encoder;
 pub mod hifigan;
 pub mod flow;
+use crate::models::s3gen::utils::mel::mel_spectrogram;
 
 use std::path::Path;
-use tch::{Device, Kind, Tensor};
+use tch::{Device, IndexOp, Kind, Tensor};
 
-use crate::error::Result;
+use crate::error::{ChatterboxError, Result};
 
 /// Output sample rate for S3Gen (24kHz).
 pub const S3GEN_SR: u32 = 24000;
@@ -112,6 +113,7 @@ pub struct S3Gen {
     meanflow: bool,
     dtype: Kind,
     tokenizer: tokenizer::S3Tokenizer,
+    speaker_encoder: speaker_encoder::CampPlus,
     hifigan: hifigan::HiFTGenerator,
     flow: flow::CausalMaskedDiffWithXvec,
 }
@@ -125,6 +127,7 @@ impl S3Gen {
     ) -> Result<Self> {
         let weights = weights::Weights::load(path, device)?;
         let tokenizer = tokenizer::S3Tokenizer::from_weights(&weights, device)?;
+        let speaker_encoder = speaker_encoder::CampPlus::from_weights(&weights)?;
         let hifigan = hifigan::HiFTGenerator::from_weights(&weights)?;
         let flow = flow::CausalMaskedDiffWithXvec::from_weights(&weights)?;
         Ok(Self {
@@ -133,6 +136,7 @@ impl S3Gen {
             meanflow,
             dtype: Kind::Float,
             tokenizer,
+            speaker_encoder,
             hifigan,
             flow,
         })
@@ -146,12 +150,85 @@ impl S3Gen {
         &self.tokenizer
     }
 
+    pub fn speaker_encoder(&self) -> &speaker_encoder::CampPlus {
+        &self.speaker_encoder
+    }
+
+    pub fn resample_to_16k(&self, wav: &Tensor) -> Result<Tensor> {
+        resample_linear(wav, S3GEN_SR as i64, S3_SR as i64)
+    }
+
     pub fn dtype(&self) -> Kind {
         self.dtype
     }
 
     pub fn set_dtype(&mut self, dtype: Kind) {
         self.dtype = dtype;
+    }
+
+    /// Compute reference embeddings (prompt tokens, mel, speaker embedding).
+    pub fn embed_ref(&self, ref_wav: &Tensor, ref_sr: i64) -> Result<S3GenRef> {
+        let mut ref_wav = if ref_wav.dim() == 1 {
+            ref_wav.unsqueeze(0)
+        } else {
+            ref_wav.shallow_clone()
+        };
+
+        if ref_wav.size()[1] > 10 * ref_sr {
+            eprintln!("[WARN] S3Gen received ref longer than 10s ({} samples at {}Hz).", ref_wav.size()[1], ref_sr);
+        }
+
+        ref_wav = ref_wav.to_device(self.device).to_kind(self.dtype);
+
+        let ref_wav_24 = if ref_sr != S3GEN_SR as i64 {
+            resample_linear(&ref_wav, ref_sr, S3GEN_SR as i64)?
+        } else {
+            ref_wav.shallow_clone()
+        };
+
+        let ref_mels_24 = mel_spectrogram(
+            &ref_wav_24,
+            1920,
+            80,
+            S3GEN_SR as i64,
+            480,
+            1920,
+            0.0,
+            8000.0,
+            false,
+        )
+        .transpose(1, 2)
+        .to_kind(self.dtype);
+
+        let ref_wav_16 = if ref_sr != S3_SR as i64 {
+            resample_linear(&ref_wav, ref_sr, S3_SR as i64)?
+        } else {
+            ref_wav.shallow_clone()
+        };
+
+        let embedding = self.speaker_encoder.inference(&[ref_wav_16.shallow_clone()])?;
+
+        let (mut ref_tokens, mut ref_token_lens) =
+            self.tokenizer.forward(&ref_wav_16.to_kind(Kind::Float), None)?;
+
+        if ref_mels_24.size()[1] != 2 * ref_tokens.size()[1] {
+            eprintln!(
+                "[WARN] Reference mel length is not equal to 2 * reference token length."
+            );
+            let keep = ref_mels_24.size()[1] / 2;
+            ref_tokens = ref_tokens.narrow(1, 0, keep);
+            if ref_token_lens.numel() > 0 {
+                ref_token_lens.i(0).fill_(keep);
+            }
+        }
+
+        Ok(S3GenRef::new(
+            ref_tokens,
+            ref_token_lens,
+            ref_mels_24,
+            None,
+            embedding,
+        ))
     }
 
     /// Run S3Gen inference (token -> waveform).
@@ -232,6 +309,28 @@ impl S3Gen {
     pub fn weights(&self) -> &weights::Weights {
         &self.weights
     }
+}
+
+fn resample_linear(wav: &Tensor, src_sr: i64, dst_sr: i64) -> Result<Tensor> {
+    if src_sr == dst_sr {
+        return Ok(wav.shallow_clone());
+    }
+    let squeeze = wav.dim() == 1;
+    let wav = if squeeze {
+        wav.unsqueeze(0)
+    } else {
+        wav.shallow_clone()
+    };
+    if wav.dim() != 2 {
+        return Err(ChatterboxError::ShapeMismatch(
+            "resample_linear expects [T] or [B, T] waveform".to_string(),
+        ));
+    }
+    let scale = dst_sr as f64 / src_sr as f64;
+    let wav = wav.unsqueeze(1);
+    let out = wav.upsample_linear1d_vec(None::<&[i64]>, false, &[scale]);
+    let out = out.squeeze_dim(1);
+    Ok(if squeeze { out.squeeze_dim(0) } else { out })
 }
 
 fn debug_stats(name: &str, tensor: &Tensor) {

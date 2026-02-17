@@ -620,8 +620,6 @@ impl ChatterboxTTS {
         let torch = py.import("torch")?;
 
         let device_str = self.device.as_str();
-        let s3gen_obj = self.inner.getattr(py, "s3gen")?;
-        let s3gen = s3gen_obj.bind(py);
         let t3_obj = self.inner.getattr(py, "t3")?;
         let t3 = t3_obj.bind(py);
         let ve_obj = self.inner.getattr(py, "ve")?;
@@ -631,24 +629,23 @@ impl ChatterboxTTS {
         let load_kwargs = PyDict::new(py);
         load_kwargs.set_item("sr", S3GEN_SR)?;
         let wav_tuple = librosa.call_method("load", (wav_str.as_ref(),), Some(&load_kwargs))?;
-        let s3gen_ref_wav = wav_tuple.get_item(0)?;
+        let s3gen_ref_wav_np = wav_tuple.get_item(0)?;
+        let s3gen_ref_wav = torch.call_method1("from_numpy", (s3gen_ref_wav_np.clone(),))?;
 
-        // Resample to 16kHz for voice encoder
+        // Resample to 16kHz for voice encoder (Python path for now)
         let resample_kwargs = PyDict::new(py);
         resample_kwargs.set_item("orig_sr", S3GEN_SR)?;
         resample_kwargs.set_item("target_sr", S3_SR)?;
         let ref_16k_wav =
-            librosa.call_method("resample", (s3gen_ref_wav.clone(),), Some(&resample_kwargs))?;
+            librosa.call_method("resample", (s3gen_ref_wav_np,), Some(&resample_kwargs))?;
 
         // Truncate decoder conditioning audio
         let dec_slice = PySlice::new(py, 0, Self::DEC_COND_LEN as isize, 1);
         let s3gen_ref_wav = s3gen_ref_wav.get_item(dec_slice)?;
 
-        // S3Gen reference embeddings
-        let embed_kwargs = PyDict::new(py);
-        embed_kwargs.set_item("ref_sr", S3GEN_SR)?;
-        embed_kwargs.set_item("device", device_str)?;
-        let s3gen_ref_dict = s3gen.call_method("embed_ref", (s3gen_ref_wav,), Some(&embed_kwargs))?;
+        let s3gen_ref_tch = py_tensor_to_tch(py, &s3gen_ref_wav)?;
+        let s3gen_ref = self.s3gen_rs.embed_ref(&s3gen_ref_tch, S3GEN_SR as i64)?;
+        let s3gen_ref_dict = s3gen_ref_to_py(py, &s3gen_ref)?;
 
         // Speech cond prompt tokens (optional)
         let plen: u32 = t3
@@ -657,19 +654,22 @@ impl ChatterboxTTS {
             .extract()?;
 
         let t3_cond_prompt_tokens: Option<Py<PyAny>> = if plen > 0 {
-            let enc_slice = PySlice::new(py, 0, Self::ENC_COND_LEN as isize, 1);
-            let ref_16k_slice = ref_16k_wav.get_item(enc_slice)?;
-            let ref_list = PyList::new(py, &[ref_16k_slice])?;
-
-            let tokzr = s3gen.getattr("tokenizer")?;
-            let forward_kwargs = PyDict::new(py);
-            forward_kwargs.set_item("max_len", plen)?;
-            let forward_out = tokzr.call_method("forward", (ref_list,), Some(&forward_kwargs))?;
-            let tokens = forward_out.get_item(0)?;
-
-            let tokens = torch.call_method1("atleast_2d", (tokens,))?;
-            let tokens = tokens.call_method1("to", (device_str,))?;
-            Some(tokens.unbind())
+            let ref_16k = self.s3gen_rs.resample_to_16k(&s3gen_ref_tch)?;
+            let ref_16k = if ref_16k.dim() == 1 {
+                ref_16k.unsqueeze(0)
+            } else {
+                ref_16k
+            };
+            let enc_len = Self::ENC_COND_LEN as i64;
+            let ref_16k = if ref_16k.size()[1] > enc_len {
+                ref_16k.narrow(1, 0, enc_len)
+            } else {
+                ref_16k
+            };
+            let (tokens, _lens) = self.s3gen_rs.tokenizer().forward(&ref_16k, Some(plen as i64))?;
+            let tokens_py = tch_tensor_to_py_with_dtype(py, &tokens, "int64")?;
+            let tokens_py = tokens_py.bind(py).call_method1("to", (device_str,))?;
+            Some(tokens_py.unbind())
         } else {
             None
         };
@@ -695,7 +695,7 @@ impl ChatterboxTTS {
         };
         let t3_cond = t3_cond.to_device(py, device_str)?;
 
-        let conds = Conditionals::new(t3_cond, s3gen_ref_dict.unbind());
+        let conds = Conditionals::new(t3_cond, s3gen_ref_dict);
         let conds_obj = conds.to_py(py)?;
         self.inner.setattr(py, "conds", conds_obj)?;
         Ok(())
@@ -889,6 +889,33 @@ fn tch_tensor_to_py(py: Python<'_>, tensor: &TchTensor) -> Result<Py<PyAny>> {
     let torch = py.import("torch")?;
     let out = torch.call_method1("from_numpy", (array,))?;
     Ok(out.into())
+}
+
+fn tch_tensor_to_py_with_dtype(
+    py: Python<'_>,
+    tensor: &TchTensor,
+    dtype_name: &str,
+) -> Result<Py<PyAny>> {
+    let torch = py.import("torch")?;
+    let out = tch_tensor_to_py(py, tensor)?;
+    let dtype = torch.getattr(dtype_name)?;
+    let cast = out.bind(py).call_method1("to", (dtype,))?;
+    Ok(cast.unbind())
+}
+
+fn s3gen_ref_to_py(py: Python<'_>, ref_dict: &S3GenRef) -> Result<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    let prompt_token = tch_tensor_to_py_with_dtype(py, &ref_dict.prompt_token, "int64")?;
+    let prompt_token_len = tch_tensor_to_py_with_dtype(py, &ref_dict.prompt_token_len, "int64")?;
+    let prompt_feat = tch_tensor_to_py(py, &ref_dict.prompt_feat)?;
+    let embedding = tch_tensor_to_py(py, &ref_dict.embedding)?;
+
+    dict.set_item("prompt_token", prompt_token)?;
+    dict.set_item("prompt_token_len", prompt_token_len)?;
+    dict.set_item("prompt_feat", prompt_feat)?;
+    dict.set_item("prompt_feat_len", py.None())?;
+    dict.set_item("embedding", embedding)?;
+    Ok(dict.into())
 }
 
 /// Utility function to print device and environment info
