@@ -8,8 +8,10 @@
 //! - `inference` - Inference-related components (AlignmentStreamAnalyzer, T3HuggingfaceBackend)
 
 pub mod inference;
+pub mod rust;
 
 pub use inference::{AlignmentStreamAnalyzer, T3HuggingfaceBackend};
+pub use rust::{T3CondRust, T3Rust};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};

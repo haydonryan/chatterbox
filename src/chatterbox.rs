@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::audio;
 use crate::error::{ChatterboxError, Result};
 use crate::models::s3gen::SPEECH_VOCAB_SIZE;
-use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3, T3Cond, VoiceEncoder};
+use crate::models::{EnTokenizer, S3Gen, S3GenInferenceOptions, S3GenRef, T3, T3Cond, T3CondRust, T3Rust, VoiceEncoder};
 use tch::{Device as TchDevice, IndexOp, Kind as TchKind, Tensor as TchTensor};
 
 // Sample rate constants from Python
@@ -428,6 +428,8 @@ pub struct ChatterboxTTS {
     s3gen_rs: S3Gen,
     /// Rust-native VoiceEncoder
     voice_encoder: VoiceEncoder,
+    /// Rust-native T3 inference
+    t3_rs: T3Rust,
 }
 
 impl ChatterboxTTS {
@@ -542,6 +544,8 @@ impl ChatterboxTTS {
         t3.to_device(py, device_str)?;
         t3.eval(py)?;
 
+        let t3_rs = T3Rust::from_safetensors(&t3_path, device.to_tch_device())?;
+
         println!("[DEBUG] Loading S3Gen...");
         let s3gen = s3gen_class.call0()?;
         let s3gen_path = ckpt_dir.join("s3gen.safetensors");
@@ -588,6 +592,7 @@ impl ChatterboxTTS {
             tokenizer,
             s3gen_rs,
             voice_encoder,
+            t3_rs,
         })
     }
 
@@ -636,8 +641,6 @@ impl ChatterboxTTS {
         let exag = exaggeration.unwrap_or(0.5);
 
         let device_str = self.device.as_str();
-        let t3_obj = self.inner.getattr(py, "t3")?;
-        let t3 = t3_obj.bind(py);
 
         // Load reference wav (Rust) and resample to 24kHz
         let (wav_samples, wav_sr) = audio::load_wav_mono(wav_path)?;
@@ -659,10 +662,7 @@ impl ChatterboxTTS {
         let s3gen_ref_dict = s3gen_ref_to_py(py, &s3gen_ref)?;
 
         // Speech cond prompt tokens (optional)
-        let plen: u32 = t3
-            .getattr("hp")?
-            .getattr("speech_cond_prompt_len")?
-            .extract()?;
+        let plen: u32 = self.t3_rs.config().speech_cond_prompt_len;
 
         let t3_cond_prompt_tokens: Option<Py<PyAny>> = if plen > 0 {
             let ref_16k = self.s3gen_rs.resample_to_16k(&s3gen_ref_tch)?;
@@ -773,10 +773,8 @@ impl ChatterboxTTS {
             text_tokens = torch.call_method(py, "cat", (cat_inputs,), Some(&cat_kwargs))?;
         }
 
-        let t3 = self.inner.getattr(py, "t3")?;
-        let hp = t3.getattr(py, "hp")?;
-        let sot: i64 = hp.getattr(py, "start_text_token")?.extract(py)?;
-        let eot: i64 = hp.getattr(py, "stop_text_token")?.extract(py)?;
+        let sot: i64 = self.t3_rs.config().start_text_token as i64;
+        let eot: i64 = self.t3_rs.config().stop_text_token as i64;
 
         let pad_kwargs = PyDict::new(py);
         pad_kwargs.set_item("value", sot)?;
@@ -786,30 +784,23 @@ impl ChatterboxTTS {
         pad_kwargs.set_item("value", eot)?;
         text_tokens = torch_fn.call_method(py, "pad", (text_tokens, (0, 1)), Some(&pad_kwargs))?;
 
-        let inference_mode = torch.call_method0(py, "inference_mode")?;
-        inference_mode.call_method0(py, "__enter__")?;
-        let speech_tokens_result = (|| -> PyResult<Py<PyAny>> {
-            let t3_cond = conds.getattr(py, "t3")?;
-            let t3_kwargs = PyDict::new(py);
-            t3_kwargs.set_item("t3_cond", t3_cond)?;
-            t3_kwargs.set_item("text_tokens", text_tokens)?;
-            t3_kwargs.set_item("max_new_tokens", 1000)?;
-            t3_kwargs.set_item("temperature", options.temperature)?;
-            t3_kwargs.set_item("cfg_weight", options.cfg_weight)?;
-            t3_kwargs.set_item("repetition_penalty", options.repetition_penalty)?;
-            t3_kwargs.set_item("min_p", options.min_p)?;
-            t3_kwargs.set_item("top_p", options.top_p)?;
+        let t3_cond = conds.getattr(py, "t3")?;
+        let t3_cond = t3_cond.bind(py);
+        let t3_cond_rs = t3_cond_from_py(py, &t3_cond)?;
 
-            let speech_tokens = t3.call_method(py, "inference", (), Some(&t3_kwargs))?;
-            Ok(speech_tokens.bind(py).get_item(0)?.unbind())
-        })();
-        inference_mode.call_method1(py, "__exit__", (py.None(), py.None(), py.None()))?;
-        let speech_tokens = speech_tokens_result?;
+        let text_tokens_tch = py_tensor_to_tch(py, &text_tokens.bind(py))?;
+        let t3_opts = crate::models::t3::T3InferenceOptions::new()
+            .temperature(options.temperature)
+            .top_p(options.top_p)
+            .min_p(options.min_p)
+            .repetition_penalty(options.repetition_penalty)
+            .cfg_weight(options.cfg_weight)
+            .max_new_tokens(1000);
+        let tokens_tch = self.t3_rs.inference(&text_tokens_tch, &t3_cond_rs, &t3_opts)?;
 
         let gen_any = conds.getattr(py, "gen")?;
         let gen_dict = gen_any.bind(py);
         let ref_dict = self.py_ref_to_s3gen(py, &gen_dict)?;
-        let tokens_tch = py_tensor_to_tch(py, &speech_tokens.bind(py))?;
         let tokens_tch = drop_invalid_s3_tokens(&tokens_tch)?;
         let wav_tch = self
             .s3gen_rs
@@ -919,6 +910,39 @@ fn s3gen_ref_to_py(py: Python<'_>, ref_dict: &S3GenRef) -> Result<Py<PyAny>> {
     dict.set_item("prompt_feat_len", py.None())?;
     dict.set_item("embedding", embedding)?;
     Ok(dict.into())
+}
+
+fn t3_cond_from_py(py: Python<'_>, t3_cond: &Bound<'_, PyAny>) -> Result<T3CondRust> {
+    let speaker_emb = t3_cond.getattr("speaker_emb")?;
+    let speaker_emb = py_tensor_to_tch(py, &speaker_emb)?;
+
+    let cond_prompt_speech_tokens = t3_cond.getattr("cond_prompt_speech_tokens")?;
+    let cond_prompt_speech_tokens = if cond_prompt_speech_tokens.is_none() {
+        None
+    } else {
+        Some(py_tensor_to_tch(py, &cond_prompt_speech_tokens)?)
+    };
+
+    let cond_prompt_speech_emb = t3_cond.getattr("cond_prompt_speech_emb")?;
+    let cond_prompt_speech_emb = if cond_prompt_speech_emb.is_none() {
+        None
+    } else {
+        Some(py_tensor_to_tch(py, &cond_prompt_speech_emb)?)
+    };
+
+    let emotion_adv = t3_cond.getattr("emotion_adv")?;
+    let emotion_adv = if emotion_adv.is_none() {
+        None
+    } else {
+        Some(py_tensor_to_tch(py, &emotion_adv)?)
+    };
+
+    Ok(T3CondRust {
+        speaker_emb,
+        cond_prompt_speech_tokens,
+        cond_prompt_speech_emb,
+        emotion_adv,
+    })
 }
 
 fn drop_invalid_s3_tokens(tokens: &TchTensor) -> Result<TchTensor> {
