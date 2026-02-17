@@ -33,7 +33,7 @@
 #
 #
 # class AlignmentStreamAnalyzer:
-#     def __init__(self, tfmr, queue, text_tokens_slice, alignment_layer_idx=9, eos_idx=0):
+#     def __init__(self, tfmr, text_tokens_slice, alignment_layer_idx=9, eos_idx=0):
 #         """
 #         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
 #         activation maps. This module exploits this to perform online integrity checks which streaming.
@@ -42,7 +42,6 @@
 #
 #         NOTE: currently requires no queues.
 #         """
-#         # self.queue = queue
 #         self.text_tokens_slice = (i, j) = text_tokens_slice
 #         self.eos_idx = eos_idx
 #         self.alignment = torch.zeros(0, j-i)
