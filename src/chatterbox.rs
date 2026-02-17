@@ -1,10 +1,10 @@
 use hf_hub::api::sync::Api;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList, PySlice};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ChatterboxError, Result};
-use crate::models::{S3Gen, VoiceEncoder, T3};
+use crate::models::{T3, T3Cond, VoiceEncoder};
 
 // Sample rate constants from Python
 pub const S3GEN_SR: u32 = 24000; // Output sample rate
@@ -474,8 +474,89 @@ impl ChatterboxTTS {
         let wav_str = wav_path.to_string_lossy();
         let exag = exaggeration.unwrap_or(0.5);
 
-        self.inner
-            .call_method1(py, "prepare_conditionals", (wav_str.as_ref(), exag))?;
+        let librosa = py.import("librosa")?;
+        let torch = py.import("torch")?;
+        let tts_mod = py.import("chatterbox.tts")?;
+        let conditionals_class = tts_mod.getattr("Conditionals")?;
+
+        let device_str = self.device.as_str();
+        let s3gen_obj = self.inner.getattr(py, "s3gen")?;
+        let s3gen = s3gen_obj.bind(py);
+        let t3_obj = self.inner.getattr(py, "t3")?;
+        let t3 = t3_obj.bind(py);
+        let ve_obj = self.inner.getattr(py, "ve")?;
+        let ve = ve_obj.bind(py);
+
+        // Load reference wav at 24kHz
+        let load_kwargs = PyDict::new(py);
+        load_kwargs.set_item("sr", S3GEN_SR)?;
+        let wav_tuple = librosa.call_method("load", (wav_str.as_ref(),), Some(&load_kwargs))?;
+        let s3gen_ref_wav = wav_tuple.get_item(0)?;
+
+        // Resample to 16kHz for voice encoder
+        let resample_kwargs = PyDict::new(py);
+        resample_kwargs.set_item("orig_sr", S3GEN_SR)?;
+        resample_kwargs.set_item("target_sr", S3_SR)?;
+        let ref_16k_wav =
+            librosa.call_method("resample", (s3gen_ref_wav.clone(),), Some(&resample_kwargs))?;
+
+        // Truncate decoder conditioning audio
+        let dec_slice = PySlice::new(py, 0, Self::DEC_COND_LEN as isize, 1);
+        let s3gen_ref_wav = s3gen_ref_wav.get_item(dec_slice)?;
+
+        // S3Gen reference embeddings
+        let embed_kwargs = PyDict::new(py);
+        embed_kwargs.set_item("ref_sr", S3GEN_SR)?;
+        embed_kwargs.set_item("device", device_str)?;
+        let s3gen_ref_dict = s3gen.call_method("embed_ref", (s3gen_ref_wav,), Some(&embed_kwargs))?;
+
+        // Speech cond prompt tokens (optional)
+        let plen: u32 = t3
+            .getattr("hp")?
+            .getattr("speech_cond_prompt_len")?
+            .extract()?;
+
+        let t3_cond_prompt_tokens: Option<Py<PyAny>> = if plen > 0 {
+            let enc_slice = PySlice::new(py, 0, Self::ENC_COND_LEN as isize, 1);
+            let ref_16k_slice = ref_16k_wav.get_item(enc_slice)?;
+            let ref_list = PyList::new(py, &[ref_16k_slice])?;
+
+            let tokzr = s3gen.getattr("tokenizer")?;
+            let forward_kwargs = PyDict::new(py);
+            forward_kwargs.set_item("max_len", plen)?;
+            let forward_out = tokzr.call_method("forward", (ref_list,), Some(&forward_kwargs))?;
+            let tokens = forward_out.get_item(0)?;
+
+            let tokens = torch.call_method1("atleast_2d", (tokens,))?;
+            let tokens = tokens.call_method1("to", (device_str,))?;
+            Some(tokens.unbind())
+        } else {
+            None
+        };
+
+        // Voice-encoder speaker embedding
+        let wavs_list = PyList::new(py, &[ref_16k_wav])?;
+        let ve_kwargs = PyDict::new(py);
+        ve_kwargs.set_item("sample_rate", S3_SR)?;
+        ve_kwargs.set_item("as_spk", false)?;
+        let ve_embeds = ve.call_method("embeds_from_wavs", (wavs_list,), Some(&ve_kwargs))?;
+
+        let ve_embed = torch.call_method1("from_numpy", (ve_embeds,))?;
+        let mean_kwargs = PyDict::new(py);
+        mean_kwargs.set_item("dim", 0)?;
+        mean_kwargs.set_item("keepdim", true)?;
+        let ve_embed = ve_embed.call_method("mean", (), Some(&mean_kwargs))?;
+        let ve_embed = ve_embed.call_method1("to", (device_str,))?;
+
+        let t3_tokens_bound = t3_cond_prompt_tokens.as_ref().map(|t| t.bind(py));
+        let t3_cond = match t3_tokens_bound {
+            Some(ref tokens) => T3Cond::new(py, &ve_embed, Some(tokens), Some(exag))?,
+            None => T3Cond::new(py, &ve_embed, None, Some(exag))?,
+        };
+        let t3_cond = t3_cond.to_device(py, device_str)?;
+
+        let conds = conditionals_class.call1((t3_cond.as_py(), s3gen_ref_dict))?;
+        self.inner.setattr(py, "conds", conds)?;
         Ok(())
     }
 

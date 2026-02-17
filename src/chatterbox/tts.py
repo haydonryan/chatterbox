@@ -177,31 +177,31 @@ class ChatterboxTTS:
 #
 #        return cls.from_local(Path(local_path).parent, device)
 
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        ## Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
-
-        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
-        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
-
-        # Speech cond prompt tokens
-        if plen := self.t3.hp.speech_cond_prompt_len:
-            s3_tokzr = self.s3gen.tokenizer
-            t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
-            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
-
-        # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
-
-        t3_cond = T3Cond(
-            speaker_emb=ve_embed,
-            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
-        ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+#    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+#        ## Load reference wav
+#        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+#
+#        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+#
+#        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
+#        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+#
+#        # Speech cond prompt tokens
+#        if plen := self.t3.hp.speech_cond_prompt_len:
+#            s3_tokzr = self.s3gen.tokenizer
+#            t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
+#            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+#
+#        # Voice-encoder speaker embedding
+#        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+#        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+#
+#        t3_cond = T3Cond(
+#            speaker_emb=ve_embed,
+#            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+#            emotion_adv=exaggeration * torch.ones(1, 1, 1),
+#        ).to(device=self.device)
+#        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
         self,
