@@ -2,6 +2,14 @@
 //!
 //! T3 is a transformer-based text-to-speech token model that converts
 //! text tokens into speech tokens using a LLaMA backbone.
+//!
+//! ## Submodules
+//!
+//! - `inference` - Inference-related components (AlignmentStreamAnalyzer, T3HuggingfaceBackend)
+
+pub mod inference;
+
+pub use inference::{AlignmentStreamAnalyzer, T3HuggingfaceBackend};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
