@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+# from dataclasses import dataclass  # Migrated to Rust
 from pathlib import Path
 import os
 
@@ -47,86 +47,88 @@ SUPPORTED_LANGUAGES = {
 }
 
 
-def punc_norm(text: str) -> str:
-    """
-        Quick cleanup func for punctuation from LLMs or
-        containing chars not seen often in the dataset
-    """
-    if len(text) == 0:
-        return "You need to add some text for me to talk."
+# Migrated to Rust: src/chatterbox.rs::punc_norm
+#def punc_norm(text: str) -> str:
+#    """
+#        Quick cleanup func for punctuation from LLMs or
+#        containing chars not seen often in the dataset
+#    """
+#    if len(text) == 0:
+#        return "You need to add some text for me to talk."
+#
+#    # Capitalise first letter
+#    if text[0].islower():
+#        text = text[0].upper() + text[1:]
+#
+#    # Remove multiple space chars
+#    text = " ".join(text.split())
+#
+#    # Replace uncommon/llm punc
+#    punc_to_replace = [
+#        ("...", ", "),
+#        ("…", ", "),
+#        (":", ","),
+#        (" - ", ", "),
+#        (";", ", "),
+#        ("—", "-"),
+#        ("–", "-"),
+#        (" ,", ","),
+#        (""", "\""),
+#        (""", "\""),
+#        ("'", "'"),
+#        ("'", "'"),
+#    ]
+#    for old_char_sequence, new_char in punc_to_replace:
+#        text = text.replace(old_char_sequence, new_char)
+#
+#    # Add full stop if no ending punc
+#    text = text.rstrip(" ")
+#    sentence_enders = {".", "!", "?", "-", ",","、","，","。","？","！"}
+#    if not any(text.endswith(p) for p in sentence_enders):
+#        text += "."
+#
+#    return text
 
-    # Capitalise first letter
-    if text[0].islower():
-        text = text[0].upper() + text[1:]
 
-    # Remove multiple space chars
-    text = " ".join(text.split())
-
-    # Replace uncommon/llm punc
-    punc_to_replace = [
-        ("...", ", "),
-        ("…", ", "),
-        (":", ","),
-        (" - ", ", "),
-        (";", ", "),
-        ("—", "-"),
-        ("–", "-"),
-        (" ,", ","),
-        ("“", "\""),
-        ("”", "\""),
-        ("‘", "'"),
-        ("’", "'"),
-    ]
-    for old_char_sequence, new_char in punc_to_replace:
-        text = text.replace(old_char_sequence, new_char)
-
-    # Add full stop if no ending punc
-    text = text.rstrip(" ")
-    sentence_enders = {".", "!", "?", "-", ",","、","，","。","？","！"}
-    if not any(text.endswith(p) for p in sentence_enders):
-        text += "."
-
-    return text
-
-
-@dataclass
-class Conditionals:
-    """
-    Conditionals for T3 and S3Gen
-    - T3 conditionals:
-        - speaker_emb
-        - clap_emb
-        - cond_prompt_speech_tokens
-        - cond_prompt_speech_emb
-        - emotion_adv
-    - S3Gen conditionals:
-        - prompt_token
-        - prompt_token_len
-        - prompt_feat
-        - prompt_feat_len
-        - embedding
-    """
-    t3: T3Cond
-    gen: dict
-
-    def to(self, device):
-        self.t3 = self.t3.to(device=device)
-        for k, v in self.gen.items():
-            if torch.is_tensor(v):
-                self.gen[k] = v.to(device=device)
-        return self
-
-    def save(self, fpath: Path):
-        arg_dict = dict(
-            t3=self.t3.__dict__,
-            gen=self.gen
-        )
-        torch.save(arg_dict, fpath)
-
-    @classmethod
-    def load(cls, fpath, map_location="cpu"):
-        kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
-        return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
+# Migrated to Rust: src/chatterbox.rs::Conditionals
+#@dataclass
+#class Conditionals:
+#    """
+#    Conditionals for T3 and S3Gen
+#    - T3 conditionals:
+#        - speaker_emb
+#        - clap_emb
+#        - cond_prompt_speech_tokens
+#        - cond_prompt_speech_emb
+#        - emotion_adv
+#    - S3Gen conditionals:
+#        - prompt_token
+#        - prompt_token_len
+#        - prompt_feat
+#        - prompt_feat_len
+#        - embedding
+#    """
+#    t3: T3Cond
+#    gen: dict
+#
+#    def to(self, device):
+#        self.t3 = self.t3.to(device=device)
+#        for k, v in self.gen.items():
+#            if torch.is_tensor(v):
+#                self.gen[k] = v.to(device=device)
+#        return self
+#
+#    def save(self, fpath: Path):
+#        arg_dict = dict(
+#            t3=self.t3.__dict__,
+#            gen=self.gen
+#        )
+#        torch.save(arg_dict, fpath)
+#
+#    @classmethod
+#    def load(cls, fpath, map_location="cpu"):
+#        kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
+#        return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 
 class ChatterboxMultilingualTTS:
